@@ -1,0 +1,89 @@
+﻿<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Panel de soporte · Lavandería Mili</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="soporte.css" />
+</head>
+<body>
+
+<!-- ============================ ACCESO ============================ -->
+<main class="acceso" id="acceso">
+  <div class="acceso-card">
+    <p class="eyebrow">Panel interno</p>
+    <h1>Soporte técnico</h1>
+    <p class="acceso-sub">Tickets que los operadores registran desde este equipo. El panel es de consulta.</p>
+
+    <p class="error" id="errorAcceso" role="alert"></p>
+    <button class="btn primario" type="button" id="btnEntrar">Ver tickets de este equipo</button>
+
+    <div class="acceso-pie">
+      <a class="enlace" href="../index.html">Volver a la app</a>
+    </div>
+  </div>
+</main>
+
+<!-- ============================ PANEL ============================= -->
+<div class="panel" id="panel" hidden>
+  <header class="barra">
+    <div class="barra-marca">
+      <span class="logo">LM</span>
+      <div>
+        <strong>Panel de soporte</strong>
+        <span id="contexto">—</span>
+      </div>
+    </div>
+    <div class="barra-acciones">
+      <span class="chip" id="versionSoporte">—</span>
+      <span class="chip" id="chipSesion">—</span>
+      <button class="btn" type="button" id="btnRecargar">Actualizar</button>
+      <button class="btn" type="button" id="btnSalir">Salir</button>
+    </div>
+  </header>
+
+  <div class="contenido">
+    <section class="alertas" id="alertas" hidden></section>
+
+    <section class="kpis" id="kpis"></section>
+
+    <section class="filtros">
+      <input id="buscar" type="search" placeholder="Buscar por asunto, autor o texto" aria-label="Buscar tickets" />
+      <select id="filtroEstado" aria-label="Filtrar por estado">
+        <option value="todos">Todos los estados</option>
+        <option value="abierta">Abiertas</option>
+        <option value="en proceso">En proceso</option>
+        <option value="cerrada">Cerradas</option>
+      </select>
+      <select id="filtroPrioridad" aria-label="Filtrar por prioridad">
+        <option value="todas">Toda prioridad</option>
+        <option value="Urgente">Urgente</option>
+        <option value="Alta">Alta</option>
+        <option value="Normal">Normal</option>
+      </select>
+    </section>
+
+    <section class="lista-tickets" id="lista"></section>
+  </div>
+
+  <aside class="detalle" id="detalle" hidden aria-hidden="true">
+    <header class="detalle-head">
+      <div>
+        <p class="eyebrow" id="detalleMeta">—</p>
+        <h2 id="detalleTitulo">—</h2>
+      </div>
+      <button class="btn icono" type="button" id="cerrarDetalle" aria-label="Cerrar detalle">&times;</button>
+    </header>
+
+    <div class="hilo" id="hilo"></div>
+
+  </aside>
+</div>
+
+<div class="aviso" id="aviso" hidden role="status"></div>
+
+<script src="../assets/js/config.js"></script>
+<script src="soporte.js"></script>
+</body>
+</html>

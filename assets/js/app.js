@@ -1,0 +1,4181 @@
+﻿/* ==========================================================================
+   Lavandería Mili · Lógica de la aplicación
+   ========================================================================== */
+
+(function () {
+  'use strict';
+
+  const $ = (sel, raiz = document) => raiz.querySelector(sel);
+  const $$ = (sel, raiz = document) => Array.from(raiz.querySelectorAll(sel));
+  const SESION_KEY = 'lavamili.v1.sesion';
+
+  const dinero = new Intl.NumberFormat('es-PE', {
+    style: 'currency',
+    currency: 'PEN',
+    minimumFractionDigits: 2
+  });
+  const fmtFecha = new Intl.DateTimeFormat('es-PE', { day: '2-digit', month: 'short', year: 'numeric' });
+  const fmtHora = new Intl.DateTimeFormat('es-PE', { hour: '2-digit', minute: '2-digit', hour12: true });
+  const fmtHora24 = new Intl.DateTimeFormat('es-PE', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const fmtDiaLargo = new Intl.DateTimeFormat('es-PE', { weekday: 'long', day: 'numeric', month: 'long' });
+  const fmtFechaLarga = new Intl.DateTimeFormat('es-PE', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+
+  const estado = {
+    vista: 'nuevo',
+    operador: null,
+    items: [],
+    categoria: 'todos',
+    clienteCodigo: '',
+    clienteExistente: null,
+    ordenActual: null,
+    comprobante: null,
+    recojoManual: false,
+    offsetSemana: 0,
+    temporizador: null,
+    // Asistente de ingreso: un paso visible a la vez.
+    paso: 1,
+    recepcion: { modo: 'peso', peso: '', unidades: '' },
+    verTodos: false,
+    procesoSel: null
+  };
+
+  /* ----------------------------- Utilidades ----------------------------- */
+
+  const esc = (texto) =>
+    String(texto ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  const uid = (prefijo = 'id') => `${prefijo}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const redondear = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+  const money = (n) => dinero.format(Number(n) || 0);
+  const parseNum = (v) => {
+    const n = Number(String(v ?? '').replace(',', '.'));
+    return Number.isFinite(n) ? n : 0;
+  };
+  const capitalizar = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+  const mismoDia = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  function toast(mensaje) {
+    const el = $('#toast');
+    el.textContent = mensaje;
+    el.classList.add('visible');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => el.classList.remove('visible'), 2600);
+  }
+
+  function fechaAviso(fecha) {
+    return {
+      dia: fmtDiaLargo.format(fecha),
+      hora: fmtHora.format(fecha),
+      corta: `${fmtFecha.format(fecha)} · ${fmtHora.format(fecha)}`
+    };
+  }
+
+  /* ------------------------- Horario y recojos -------------------------- */
+
+  function esDiaAtencion(fecha) {
+    return CONFIG.negocio.horario.dias.includes(fecha.getDay());
+  }
+
+  function horaDelDia(fecha, texto) {
+    const [h, m] = texto.split(':').map(Number);
+    const d = new Date(fecha);
+    d.setHours(h, m, 0, 0);
+    return d;
+  }
+
+  function siguienteApertura(fecha) {
+    const d = new Date(fecha);
+    d.setHours(0, 0, 0, 0);
+    for (let i = 0; i < 21; i++) {
+      d.setDate(d.getDate() + 1);
+      if (esDiaAtencion(d)) return horaDelDia(d, CONFIG.negocio.horario.apertura);
+    }
+    return d;
+  }
+
+  function redondearMediaHora(fecha) {
+    const d = new Date(fecha);
+    d.setSeconds(0, 0);
+    const minutos = d.getMinutes();
+    if (minutos === 0 || minutos === 30) return d;
+    d.setMinutes(minutos < 30 ? 30 : 60);
+    return d;
+  }
+
+  /** Calcula la fecha/hora de recojo respetando el horario de atención. */
+  function calcularListo(base, horas) {
+    let d = redondearMediaHora(new Date(base.getTime() + horas * 3600 * 1000));
+    const { apertura, cierre } = CONFIG.negocio.horario;
+
+    for (let i = 0; i < 30; i++) {
+      if (!esDiaAtencion(d)) {
+        d = siguienteApertura(d);
+        continue;
+      }
+      const abre = horaDelDia(d, apertura);
+      const cierra = horaDelDia(d, cierre);
+      if (d < abre) return redondearMediaHora(abre);
+      if (d > cierra) {
+        d = siguienteApertura(d);
+        continue;
+      }
+      return d;
+    }
+    return d;
+  }
+
+  /* ------------------------------ Sesión -------------------------------- */
+
+  /** El acceso es con usuario y PIN del directorio de operadores
+      (config.js y panel «Perfiles»). No hay cuentas externas ni nube. */
+
+  /* ------------------------ Directorio de usuarios ----------------------- */
+
+  /* Los operadores de config.js son la semilla. Desde que el administrador
+     toca algo en «Perfiles», manda el directorio guardado. */
+  function sembrarUsuarios() {
+    if (Store.getUsuarios().length) return;
+    CONFIG.operadores.forEach((o) => {
+      Store.addUsuario({ usuario: o.usuario, nombre: o.nombre, rol: o.rol, clave: o.pin });
+    });
+  }
+
+  function directorio() {
+    const mapa = new Map();
+    CONFIG.operadores.forEach((o) => {
+      mapa.set(String(o.usuario).toLowerCase(), {
+        id: `cfg_${o.usuario}`,
+        usuario: o.usuario,
+        nombre: o.nombre,
+        rol: String(o.rol || 'Operador'),
+        clave: String(o.pin || ''),
+        activo: true,
+        origen: 'config',
+        creado: '',
+        ultimoAcceso: ''
+      });
+    });
+    Store.getUsuarios().forEach((u) => {
+      const clave = String(u.usuario || '').toLowerCase();
+      mapa.set(clave, { ...(mapa.get(clave) || {}), ...u });
+    });
+    return [...mapa.values()];
+  }
+
+  const buscarUsuario = (usuario) =>
+    directorio().find((u) => String(u.usuario).toLowerCase() === String(usuario || '').trim().toLowerCase()) || null;
+
+  async function iniciarSesion(evento) {
+    evento.preventDefault();
+    const usuario = $('#usuario').value.trim();
+    const clave = $('#pin').value.trim();
+    const boton = $('#formLogin button[type="submit"]');
+    const textoBoton = boton ? boton.textContent : '';
+
+    if (boton) {
+      boton.disabled = true;
+      boton.textContent = 'Verificando…';
+    }
+
+    try {
+      const encontrado = buscarUsuario(usuario);
+      if (!encontrado) throw new Error('Usuario o PIN incorrectos. Verifica tus datos.');
+      if (encontrado.activo === false) throw new Error('Esa cuenta está desactivada.');
+      if (String(encontrado.clave) !== String(clave)) throw new Error('Usuario o PIN incorrectos. Verifica tus datos.');
+      estado.operador = { usuario: encontrado.usuario, nombre: encontrado.nombre, rol: encontrado.rol };
+      if (encontrado.id && !String(encontrado.id).startsWith('cfg_')) {
+        Store.actualizarUsuario(encontrado.id, { ultimoAcceso: new Date().toISOString() });
+      }
+
+      try {
+        sessionStorage.setItem(SESION_KEY, JSON.stringify(estado.operador));
+      } catch (error) {
+        /* modo privado: la sesión vive solo en memoria */
+      }
+      $('#loginError').textContent = '';
+      $('#formLogin').reset();
+      entrarAlSistema();
+    } catch (error) {
+      $('#loginError').textContent = (error && error.message) || 'No se pudo iniciar sesión.';
+      $('#pin').value = '';
+      $('#pin').focus();
+    } finally {
+      if (boton) {
+        boton.disabled = false;
+        boton.textContent = textoBoton || 'Entrar al sistema';
+      }
+    }
+  }
+
+  /** Cierra el menú de cuenta (chip de usuario). */
+  function cerrarMenuCuenta() {
+    const menu = document.getElementById('menuCuenta');
+    const boton = document.getElementById('btnMenu');
+    if (menu) menu.hidden = true;
+    if (boton) boton.setAttribute('aria-expanded', 'false');
+  }
+
+  /* El mostrador ve «Perfiles» y «Salir»; lo demás es de administración. */
+  function aplicarPermisosCabecera() {
+    const admin = esAdmin();
+    document.querySelectorAll('.solo-admin').forEach((elemento) => {
+      elemento.hidden = !admin;
+    });
+    if (!admin && $('#panelPrecios').classList.contains('is-open')) cerrarPrecios();
+  }
+
+  function entrarAlSistema() {
+    $('#pantallaLogin').classList.add('oculto');
+    $('#app').classList.remove('oculto');
+    aplicarPermisosCabecera();
+    actualizarBadgeTickets();
+    $('#usuarioChip').textContent = `${estado.operador.nombre} · ${estado.operador.rol}`;
+    actualizarFechas();
+    renderCatalogo();
+    renderItems();
+    refrescarResumen();
+    renderOrdenes();
+    renderClientes();
+    renderResumen();
+    renderBanner();
+    limpiarRecojo();
+    pintarPaso(1);
+
+    if (!estado.temporizador) {
+      estado.temporizador = setInterval(renderBanner, 60000);
+    }
+  }
+
+  function cerrarSesion() {
+    try {
+      sessionStorage.removeItem(SESION_KEY);
+    } catch (error) { /* nada */ }
+    limpiarSesionAutorizacion();
+    // Evita dejar paneles abiertos (y editables) tras salir.
+    cerrarMenuCuenta();
+    cerrarModal();
+    cerrarPrecios();
+    cerrarPerfiles();
+    const chip = document.getElementById('usuarioChip');
+    if (chip) chip.textContent = '';
+    estado.operador = null;
+    estado.items = [];
+    if (estado.temporizador) {
+      clearInterval(estado.temporizador);
+      estado.temporizador = null;
+    }
+    $('#app').classList.add('oculto');
+    $('#pantallaLogin').classList.remove('oculto');
+    $('#usuario').focus();
+  }
+
+  function restaurarSesion() {
+    try {
+      const crudo = sessionStorage.getItem(SESION_KEY);
+      if (!crudo) return;
+      const datos = JSON.parse(crudo);
+      if (datos && datos.nombre) {
+        estado.operador = datos;
+        entrarAlSistema();
+      }
+    } catch (error) { /* sin sesión */ }
+  }
+
+  /* -------------------------- Estado del equipo ------------------------- */
+
+  function pintarEstadoSync(info, vista) {
+    const el = $('#syncEstado');
+    if (!el) return;
+    el.textContent = vista.texto;
+    el.title = vista.titulo;
+    el.dataset.estado = 'local';
+  }
+
+  /** El acceso es siempre usuario + PIN: el formulario no cambia por entorno. */
+  function ajustarFormularioLogin() {
+    const nota = $('#loginModo');
+    if (!nota) return;
+    nota.textContent = 'Acceso con usuario y PIN. Los datos se guardan solo en este navegador.';
+  }
+
+  function prepararAcceso() {
+    ajustarFormularioLogin();
+    Sync.onEstado(pintarEstadoSync);
+    Sync.iniciar();
+  }
+
+  /* ------------------------------ Navegación ---------------------------- */
+
+  function cambiarVista(nombre) {
+    estado.vista = nombre;
+    $$('.tab').forEach((tab) => tab.classList.toggle('is-active', tab.dataset.vista === nombre));
+    $$('.vista').forEach((vista) => vista.classList.toggle('is-active', vista.id === `vista-${nombre}`));
+    if (nombre === 'ordenes') renderOrdenes();
+    if (nombre === 'clientes') renderClientes();
+    if (nombre === 'resumen') renderResumen();
+    if (nombre === 'tablero') renderTablero();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  /* ------------------------------- Fechas ------------------------------- */
+
+  function actualizarFechas() {
+    const hoy = new Date();
+    const texto = capitalizar(fmtFechaLarga.format(hoy));
+    $('#fechaHoy').innerHTML = `<strong>Hoy</strong> · ${esc(texto)}`;
+    $('#fechaHoyResumen').innerHTML = `<strong>Hoy</strong> · ${esc(texto)}`;
+    $('#fechaHoyTablero').innerHTML = `<strong>Hoy</strong> · ${esc(texto)}`;
+  }
+
+  /* ------------------------------ Catálogo ------------------------------ */
+
+  function renderCategorias() {
+    $('#categorias').innerHTML = CONFIG.categorias
+      .map(
+        (cat) =>
+          `<button type="button" class="cat-chip${cat.id === estado.categoria ? ' is-active' : ''}" data-categoria="${cat.id}" role="tab" aria-selected="${cat.id === estado.categoria}">${esc(cat.nombre)}</button>`
+      )
+      .join('');
+  }
+
+  function renderCatalogo() {
+    renderCategorias();
+    const overrides = Store.getPrecios();
+    /* El catálogo sigue la recepción: si se pesó, primero los servicios por
+       kilo; si se contó, los de unidad. «Ver todos» levanta el filtro. */
+    const modo = estado.recepcion.modo;
+    const porModo = (s) => estado.verTodos || !modo || s.tipo === modo;
+    const lista = CONFIG.servicios.filter(
+      (s) => porModo(s) && (estado.categoria === 'todos' || s.cat === estado.categoria)
+    );
+
+    const texto = $('#filtroModoTexto');
+    if (texto) {
+      texto.textContent = estado.verTodos
+        ? 'Mostrando todos los servicios.'
+        : `Mostrando servicios ${modo === 'peso' ? 'por kilo' : 'por unidad'} según la recepción.`;
+    }
+    const verTodos = $('#btnVerTodos');
+    if (verTodos) verTodos.textContent = estado.verTodos ? 'Ver solo los de la recepción' : 'Ver todos los servicios';
+
+    $('#catalogo').innerHTML = lista
+      .map((servicio) => {
+        const tarifa = tarifaDe(servicio, overrides);
+        // Sin tarifa configurada el servicio se cobraría en S/ 0.00: se avisa
+        // en el propio catálogo en vez de mostrar un precio engañoso.
+        const sinPrecio = !(Number(tarifa) > 0);
+        const precio = sinPrecio
+          ? 'Sin precio'
+          : servicio.tipo === 'peso'
+            ? `${money(tarifa)} / kg`
+            : `${money(tarifa)} / ${servicio.unidad}`;
+        return `<button type="button" class="svc" data-servicio="${servicio.id}" title="${esc(servicio.detalle || '')}">
+          <span class="svc-name">${esc(servicio.nombre)}</span>
+          <span class="svc-price${sinPrecio ? ' svc-sin-precio' : ''}">${precio}</span>
+          <span class="svc-detail">${esc(servicio.detalle || '')}</span>
+        </button>`;
+      })
+      .join('') || '<p class="sin-datos">No hay servicios de este tipo en esta categoría.</p>';
+  }
+
+  /* ---------------------- Permisos del tarifario ------------------------ */
+
+  const SEGURIDAD = (typeof CONFIG !== 'undefined' && CONFIG.seguridad) || {};
+  const MINUTOS_AUTORIZACION = Number(SEGURIDAD.minutosAutorizacion) > 0 ? Number(SEGURIDAD.minutosAutorizacion) : 15;
+  const LARGO_CODIGO = Number(SEGURIDAD.largoCodigo) > 0 ? Number(SEGURIDAD.largoCodigo) : 5;
+  const CLAVE_AUTORIZACION = 'lavamili.v1.autorizacion.sesion';
+
+  /* Correos con permiso de administración aunque su ficha diga otra cosa. */
+  const CORREOS_ADMIN = (Array.isArray(SEGURIDAD.correosAdmin) ? SEGURIDAD.correosAdmin : [])
+    .map((correo) => String(correo || '').trim().toLowerCase())
+    .filter(Boolean);
+
+  /**
+   * ¿Quien está conectado es administrador?
+   * Por rol (Admin, Administrador, Administradora) o por correo declarado en
+   * config.js. El correo es la red de seguridad: si el rol de Firestore está
+   * mal escrito, el dueño igual puede editar el tarifario.
+   */
+  const esAdmin = () => {
+    const rol = String((estado.operador && estado.operador.rol) || '').trim();
+    if (/admin/i.test(rol)) return true;
+    const usuario = String((estado.operador && estado.operador.usuario) || '').trim().toLowerCase();
+    return Boolean(usuario) && CORREOS_ADMIN.includes(usuario);
+  };
+
+  /* El código que el administrador entrega es de un solo uso por pestaña: el
+     operador debe teclearlo aunque exista uno vigente en la nube. */
+  function sesionAutorizacion() {
+    try {
+      const crudo = sessionStorage.getItem(CLAVE_AUTORIZACION);
+      const datos = crudo ? JSON.parse(crudo) : null;
+      return datos && datos.codigo ? datos : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function guardarSesionAutorizacion(datos) {
+    try {
+      sessionStorage.setItem(CLAVE_AUTORIZACION, JSON.stringify(datos));
+    } catch (error) { /* modo privado: vale solo en memoria */ }
+  }
+
+  function limpiarSesionAutorizacion() {
+    try {
+      sessionStorage.removeItem(CLAVE_AUTORIZACION);
+    } catch (error) { /* nada */ }
+  }
+
+  /**
+   * ¿Puede este usuario cambiar el tarifario ahora?
+   *  - Administrador: siempre.
+   *  - Operador: solo con un código vigente Y tecleado en esta pestaña.
+   */
+  function permisoPrecios() {
+    if (!estado.operador) return { editable: false, motivo: 'sin-sesion' };
+    if (esAdmin()) return { editable: true, motivo: 'admin' };
+    if (SEGURIDAD.exigirCodigoAOperador === false) return { editable: true, motivo: 'libre' };
+
+    const vigente = Store.getAutorizacion();
+    const sesion = sesionAutorizacion();
+    if (!sesion) return { editable: false, motivo: vigente ? 'falta-codigo' : 'sin-codigo' };
+
+    const expira = Date.parse(sesion.expira || '');
+    if (!Number.isFinite(expira) || expira <= Date.now()) return { editable: false, motivo: 'expirado' };
+    if (!vigente || vigente.codigo !== sesion.codigo) return { editable: false, motivo: 'revocado' };
+    return { editable: true, motivo: 'codigo', autor: sesion.autor || 'Administrador', expira };
+  }
+
+  /* horaCorta() ya existe más abajo para las tarjetas: hora del día o fecha. */
+
+  function textoPermiso(permiso) {
+    switch (permiso.motivo) {
+      case 'admin':
+        return { tono: 'ok', texto: 'Acceso de administración: puedes cambiar el tarifario. Cada cambio queda registrado.' };
+      case 'codigo':
+        return { tono: 'ok', texto: `Edición autorizada por ${esc(permiso.autor)} hasta las ${horaCorta(permiso.expira)}.` };
+      case 'falta-codigo':
+        return { tono: 'warn', texto: 'Hay un código de urgencia vigente. Tecléalo para poder editar.' };
+      case 'expirado':
+        return { tono: 'warn', texto: 'La autorización anterior venció. Pide un código nuevo al administrador.' };
+      case 'revocado':
+        return { tono: 'warn', texto: 'El código cambió. Tecléalo de nuevo para seguir editando.' };
+      case 'libre':
+        return { tono: 'ok', texto: 'Edición habilitada.' };
+      default:
+        return { tono: 'warn', texto: 'Solo lectura: el administrador es quien cambia los precios. Usa «Pedir» para solicitar un cambio.' };
+    }
+  }
+
+  /** Deja en la auditoría cada tarifa que cambió de verdad. */
+  function registrarCambiosPrecios(previos, mapa, permiso) {
+    const cambios = CONFIG.servicios
+      .map((servicio) => ({
+        id: servicio.id,
+        servicio: servicio.nombre,
+        antes: Number(tarifaDe(servicio, previos)),
+        despues: Number(tarifaDe(servicio, mapa))
+      }))
+      .filter((cambio) => Math.abs(cambio.antes - cambio.despues) > 0.004);
+
+    if (!cambios.length) return 0;
+
+    const autorizacion = Store.getAutorizacion();
+    Store.registrarAuditoria({
+      operador: (estado.operador && estado.operador.nombre) || 'Operador',
+      rol: (estado.operador && estado.operador.rol) || '',
+      via: permiso.motivo === 'admin' ? 'admin' : 'codigo',
+      codigo: permiso.motivo === 'codigo' && autorizacion ? autorizacion.codigo : '',
+      autorizador: permiso.motivo === 'codigo' ? permiso.autor || '' : '',
+      cambios
+    });
+    return cambios.length;
+  }
+
+  /* --------------------------- Panel de precios -------------------------- */
+
+  let borradorPrecios = null;
+
+  /** Tarifa vigente de un servicio (personalizada o de fábrica). */
+  function tarifaDe(servicio, overrides) {
+    const mapa = overrides || Store.getPrecios();
+    const tiene = Object.prototype.hasOwnProperty.call(mapa, servicio.id);
+    const valor = Number(mapa[servicio.id]);
+    return tiene && Number.isFinite(valor) && valor >= 0 ? valor : servicio.tarifa;
+  }
+
+  function abrirPrecios() {
+    // El tarifario es de administración; el mostrador ya no lo abre.
+    if (!esAdmin()) {
+      toast('Solo el administrador entra al tarifario');
+      return;
+    }
+    if ($('#modal').classList.contains('is-open')) cerrarModal();
+    const overrides = Store.getPrecios();
+    borradorPrecios = {};
+    CONFIG.servicios.forEach((servicio) => {
+      borradorPrecios[servicio.id] = tarifaDe(servicio, overrides);
+    });
+    $('#buscarPrecio').value = '';
+    renderPrecios();
+    $('#panelPrecios').classList.add('is-open');
+    $('#panelPrecios').setAttribute('aria-hidden', 'false');
+    $('#btnPrecios').setAttribute('aria-expanded', 'true');
+    document.body.classList.add('panel-abierto');
+    setTimeout(() => $('#buscarPrecio').focus(), 150);
+  }
+
+  function cerrarPrecios() {
+    $('#panelPrecios').classList.remove('is-open');
+    $('#panelPrecios').setAttribute('aria-hidden', 'true');
+    $('#btnPrecios').setAttribute('aria-expanded', 'false');
+    document.body.classList.remove('panel-abierto');
+  }
+
+  function renderPrecios() {
+    const permiso = permisoPrecios();
+    const bloqueado = !permiso.editable;
+    const filtro = $('#buscarPrecio').value.trim().toLowerCase();
+    const bloques = [];
+
+    // Barra de estado: quién puede editar y hasta cuándo.
+    const barra = $('#preciosPermiso');
+    if (barra) {
+      const aviso = textoPermiso(permiso);
+      barra.hidden = false;
+      barra.className = `permiso-bar ${aviso.tono}`;
+      barra.innerHTML = `<span class="permiso-dot" aria-hidden="true"></span><p>${aviso.texto}</p>`;
+    }
+
+    // Botones según rol.
+    const pendientes = Store.getSolicitudes().filter((s) => s.estado === 'pendiente');
+    /* Con el tarifario bloqueado el botón no se desactiva: cambia de acción y
+       abre el formulario del código, que es lo único que puede desbloquearlo. */
+    const guardar = $('#guardarPrecios');
+    guardar.disabled = false;
+    guardar.textContent = bloqueado ? 'Autorizar edición' : 'Guardar cambios';
+    // Restablecer deja todo en S/ 0.00: es una acción destructiva, solo admin.
+    $('#restablecerPrecios').hidden = !esAdmin();
+    $('#btnAutorizarCodigo').hidden = !esAdmin();
+    $('#btnHistorial').hidden = !esAdmin();
+    $('#btnCodigoPrecios').hidden = esAdmin();
+    $('#btnSolicitudes').hidden = !esAdmin();
+    const badge = $('#solicitudesBadge');
+    if (badge) {
+      badge.hidden = pendientes.length === 0;
+      badge.textContent = String(pendientes.length);
+    }
+
+    CONFIG.categorias
+      .filter((cat) => cat.id !== 'todos')
+      .forEach((cat) => {
+        const servicios = CONFIG.servicios.filter(
+          (s) => s.cat === cat.id && (!filtro || `${s.nombre} ${s.detalle || ''}`.toLowerCase().includes(filtro))
+        );
+        if (!servicios.length) return;
+
+        bloques.push(
+          `<h3 class="precio-grupo">${esc(cat.nombre)}</h3>` +
+            servicios
+              .map((s) => {
+                const bruto = borradorPrecios ? borradorPrecios[s.id] : undefined;
+                const valor = bruto === '' || bruto === undefined || bruto === null ? tarifaDe(s) : parseNum(bruto);
+                return `<div class="precio-row${bloqueado ? ' is-locked' : ''}">
+                  <div class="precio-info">
+                    <strong>${esc(s.nombre)}</strong>
+                    <span>${esc(s.detalle || '')}</span>
+                  </div>
+                  <label class="precio-input">
+                    <span>S/</span>
+                    <input type="number" min="0" step="0.10" inputmode="decimal" data-precio="${s.id}" value="${Number(valor).toFixed(2)}" aria-label="Precio de ${esc(s.nombre)}"${bloqueado ? ' disabled' : ''} />
+                    <small>${esc(s.unidad)}</small>
+                  </label>
+                  ${bloqueado ? `<button class="precio-pedir" type="button" data-pedir="${s.id}" title="Pedir un cambio de precio al administrador">Pedir</button>` : ''}
+                </div>`;
+              })
+              .join('')
+        );
+      });
+
+    $('#listaPrecios').innerHTML = bloques.join('') || '<p class="sin-datos">No hay servicios que coincidan.</p>';
+  }
+
+  function guardarPrecios() {
+    const permiso = permisoPrecios();
+    if (!permiso.editable) {
+      toast('Solo el administrador cambia los precios');
+      abrirModalCodigo(permiso);
+      return;
+    }
+
+    const previos = Store.getPrecios();
+    const mapa = {};
+
+    CONFIG.servicios.forEach((servicio) => {
+      const bruto = borradorPrecios ? borradorPrecios[servicio.id] : undefined;
+      const vacio = bruto === '' || bruto === undefined || bruto === null;
+      const valor = vacio ? tarifaDe(servicio, previos) : parseNum(bruto);
+      mapa[servicio.id] = valor >= 0 ? redondear(valor) : tarifaDe(servicio, previos);
+    });
+
+    Store.setPrecios(mapa);
+    const cambios = registrarCambiosPrecios(previos, mapa, permiso);
+
+    // Si el operador ya tenía prendas en el carrito, se actualizan solo
+    // aquellas cuyo precio no había sido editado a mano.
+    estado.items.forEach((item) => {
+      const servicio = CONFIG.servicios.find((s) => s.id === item.servicioId);
+      if (!servicio) return;
+      const anterior = tarifaDe(servicio, previos);
+      if (Number(item.tarifa) === Number(anterior)) item.tarifa = mapa[servicio.id];
+    });
+
+    renderCatalogo();
+    renderItems();
+    refrescarResumen();
+    cerrarPrecios();
+    toast(cambios ? `Precios actualizados · ${cambios} ${cambios === 1 ? 'cambio registrado' : 'cambios registrados'}` : 'Precios actualizados');
+  }
+
+  function restablecerPrecios() {
+    if (!esAdmin()) {
+      toast('Solo el administrador restablece el tarifario');
+      return;
+    }
+    CONFIG.servicios.forEach((servicio) => {
+      borradorPrecios[servicio.id] = servicio.tarifa;
+    });
+    renderPrecios();
+    toast('Precios de fábrica cargados. Pulsa «Guardar cambios».');
+  }
+
+  /* ------------------- Código de autorización (urgencias) ---------------- */
+
+  /** El mostrador teclea el código que le dictó el administrador. */
+  function abrirModalCodigo(permiso) {
+    const aviso = textoPermiso(permiso || permisoPrecios());
+    const vigente = Store.getAutorizacion();
+    const detalle = vigente
+      ? `Hay un código vigente hasta las ${horaCorta(vigente.expira)}.`
+      : 'No hay ningún código activo: pídele al administrador que lo cree en «Precios → Autorizar código».';
+
+    abrirModal(`
+      <h2>Autorización del administrador</h2>
+      <p class="muted">${aviso.texto}</p>
+      <p class="muted small">${detalle}</p>
+      <form id="formCodigo" autocomplete="off">
+        <label class="field">
+          <span>Código de ${LARGO_CODIGO} dígitos</span>
+          <input id="codigoInput" class="codigo-input" type="text" inputmode="numeric" maxlength="${LARGO_CODIGO}"
+            placeholder="${'0'.repeat(LARGO_CODIGO)}" autocomplete="one-time-code" aria-label="Código de autorización" />
+        </label>
+        <p class="form-error" id="codigoError" role="alert"></p>
+        <div class="modal-acciones">
+          <button class="btn btn-primary" type="submit">Autorizar edición</button>
+          <button class="btn btn-outline" type="button" data-accion="cerrar">Cancelar</button>
+        </div>
+      </form>
+    `);
+
+    const input = $('#codigoInput');
+    input.addEventListener('input', () => {
+      input.value = input.value.replace(/\D/g, '').slice(0, LARGO_CODIGO);
+    });
+
+    $('#formCodigo').addEventListener('submit', (evento) => {
+      evento.preventDefault();
+      const codigo = input.value.trim();
+      const activo = Store.getAutorizacion();
+      if (codigo.length !== LARGO_CODIGO) {
+        $('#codigoError').textContent = `El código debe tener ${LARGO_CODIGO} dígitos.`;
+        return;
+      }
+      if (!activo) {
+        $('#codigoError').textContent = 'No hay un código vigente. Pídele uno al administrador.';
+        return;
+      }
+      if (Date.parse(activo.expira) <= Date.now()) {
+        $('#codigoError').textContent = 'Ese código ya venció. Pide uno nuevo.';
+        return;
+      }
+      if (String(activo.codigo) !== codigo) {
+        $('#codigoError').textContent = 'El código no coincide. Verifícalo con el administrador.';
+        return;
+      }
+      guardarSesionAutorizacion({ codigo, autor: activo.autor || 'Administrador', expira: activo.expira });
+      Store.registrarAuditoria({
+        operador: (estado.operador && estado.operador.nombre) || 'Operador',
+        rol: (estado.operador && estado.operador.rol) || '',
+        via: 'codigo',
+        codigo,
+        autorizador: activo.autor || 'Administrador',
+        detalle: 'Código aceptado en el mostrador',
+        cambios: []
+      });
+      cerrarModal();
+      abrirPrecios();
+      toast(`Edición habilitada hasta las ${horaCorta(activo.expira)}`);
+    });
+
+    setTimeout(() => input.focus(), 120);
+  }
+
+  /** El administrador escribe el código y decide cuánto dura. */
+  function abrirModalAutorizar() {
+    if (!esAdmin()) {
+      toast('Solo el administrador autoriza códigos');
+      return;
+    }
+
+    const actual = Store.getAutorizacion();
+    const vigente = actual && Date.parse(actual.expira) > Date.now();
+
+    abrirModal(`
+      <h2>Autorizar cambio de urgencia</h2>
+      <p class="muted">Escribe un código de ${LARGO_CODIGO} dígitos y díctalo al mostrador. Sirve para editar todo el tarifario mientras esté vigente.</p>
+      ${vigente ? `<p class="muted small">Código vigente hasta las ${horaCorta(actual.expira)}. Si creas otro, el anterior deja de servir.</p>` : ''}
+      <form id="formAutorizar" autocomplete="off">
+        <label class="field">
+          <span>Código de ${LARGO_CODIGO} dígitos</span>
+          <input id="codigoNuevo" class="codigo-input" type="text" inputmode="numeric" maxlength="${LARGO_CODIGO}"
+            placeholder="${'0'.repeat(LARGO_CODIGO)}" autocomplete="off" aria-label="Nuevo código de autorización" />
+        </label>
+        <label class="field">
+          <span>Vigencia en minutos</span>
+          <input id="minutosCodigo" type="number" min="1" max="240" step="1" value="${MINUTOS_AUTORIZACION}" />
+        </label>
+        <p class="form-error" id="autorizarError" role="alert"></p>
+        <div class="modal-acciones">
+          <button class="btn btn-primary" type="submit">Crear código</button>
+          ${vigente ? '<button class="btn btn-outline" type="button" id="anularCodigo">Anular código vigente</button>' : ''}
+          <button class="btn btn-outline" type="button" data-accion="cerrar">Cancelar</button>
+        </div>
+      </form>
+    `);
+
+    const input = $('#codigoNuevo');
+    input.addEventListener('input', () => {
+      input.value = input.value.replace(/\D/g, '').slice(0, LARGO_CODIGO);
+    });
+
+    const anular = $('#anularCodigo');
+    if (anular) {
+      anular.addEventListener('click', () => {
+        Store.setAutorizacion(null);
+        Store.registrarAuditoria({
+          operador: (estado.operador && estado.operador.nombre) || 'Administrador',
+          rol: (estado.operador && estado.operador.rol) || '',
+          via: 'admin',
+          detalle: 'Código de autorización anulado',
+          cambios: []
+        });
+        limpiarSesionAutorizacion();
+        cerrarModal();
+        abrirPrecios();
+        toast('Código anulado');
+      });
+    }
+
+    $('#formAutorizar').addEventListener('submit', (evento) => {
+      evento.preventDefault();
+      const codigo = input.value.trim();
+      const minutos = Math.min(240, Math.max(1, Number($('#minutosCodigo').value) || MINUTOS_AUTORIZACION));
+
+      if (codigo.length !== LARGO_CODIGO) {
+        $('#autorizarError').textContent = `El código debe tener ${LARGO_CODIGO} dígitos.`;
+        return;
+      }
+
+      const creada = new Date();
+      const datos = {
+        codigo,
+        autor: (estado.operador && estado.operador.nombre) || 'Administrador',
+        creada: creada.toISOString(),
+        expira: new Date(creada.getTime() + minutos * 60000).toISOString()
+      };
+      Store.setAutorizacion(datos);
+      Store.registrarAuditoria({
+        operador: datos.autor,
+        rol: (estado.operador && estado.operador.rol) || '',
+        via: 'admin',
+        codigo,
+        detalle: `Código creado con ${minutos} min de vigencia`,
+        cambios: []
+      });
+
+      cerrarModal();
+      abrirPrecios();
+      toast(`Código ${codigo} válido hasta las ${horaCorta(datos.expira)}`);
+    });
+
+    setTimeout(() => input.focus(), 120);
+  }
+
+  /* --------------------- Solicitudes de cambio --------------------------- */
+
+  function abrirSolicitud(servicioId) {
+    const servicio = CONFIG.servicios.find((s) => s.id === servicioId);
+    if (!servicio) return;
+    const actual = tarifaDe(servicio);
+
+    abrirModal(`
+      <h2>Pedir cambio de precio</h2>
+      <p class="muted">${esc(servicio.nombre)} · ahora ${actual > 0 ? `${money(actual)} / ${esc(servicio.unidad)}` : 'sin precio'}</p>
+      <form id="formSolicitud">
+        <label class="field">
+          <span>Precio propuesto (S/)</span>
+          <input id="solPrecio" type="number" min="0" step="0.10" inputmode="decimal" value="${Number(actual).toFixed(2)}" required />
+        </label>
+        <label class="field">
+          <span>Motivo</span>
+          <textarea id="solNota" rows="2" placeholder="Ej. la clienta trae 8 kg y pide precio por volumen"></textarea>
+        </label>
+        <p class="form-error" id="solError" role="alert"></p>
+        <div class="modal-acciones">
+          <button class="btn btn-primary" type="submit">Enviar al administrador</button>
+          <button class="btn btn-outline" type="button" data-accion="cerrar">Cancelar</button>
+        </div>
+      </form>
+    `);
+
+    $('#formSolicitud').addEventListener('submit', (evento) => {
+      evento.preventDefault();
+      const precio = parseNum($('#solPrecio').value);
+      if (!(precio > 0)) {
+        $('#solError').textContent = 'Escribe un precio mayor a S/ 0.00.';
+        return;
+      }
+      if (redondear(precio) === redondear(actual)) {
+        $('#solError').textContent = 'El precio propuesto es el mismo que ya está en el tarifario.';
+        return;
+      }
+      Store.addSolicitud({
+        servicioId,
+        servicio: servicio.nombre,
+        unidad: servicio.unidad,
+        precioActual: redondear(actual),
+        precioPedido: redondear(precio),
+        nota: $('#solNota').value.trim(),
+        operador: (estado.operador && estado.operador.nombre) || 'Operador',
+        rol: (estado.operador && estado.operador.rol) || ''
+      });
+      cerrarModal();
+      abrirPrecios();
+      toast('Solicitud enviada al administrador');
+    });
+
+    setTimeout(() => $('#solPrecio').focus(), 120);
+  }
+
+  function abrirSolicitudes() {
+    if (!esAdmin()) {
+      toast('Solo el administrador ve las solicitudes');
+      return;
+    }
+
+    const pendientes = Store.getSolicitudes().filter((s) => s.estado === 'pendiente');
+    const filas = pendientes.length
+      ? pendientes
+          .map(
+            (s) => `<div class="sol-item">
+        <div class="sol-info">
+          <strong>${esc(s.servicio)}</strong>
+          <span>${money(s.precioActual)} → ${money(s.precioPedido)} / ${esc(s.unidad || 'und')}</span>
+          <small>${esc(s.operador || '')} · ${esc((s.creada || '').slice(0, 16).replace('T', ' '))}${s.nota ? ` · «${esc(s.nota)}»` : ''}</small>
+        </div>
+        <div class="sol-acciones">
+          <button class="btn btn-mini btn-primary" type="button" data-aprobar="${s.id}">Aplicar</button>
+          <button class="btn btn-mini" type="button" data-rechazar="${s.id}">Rechazar</button>
+        </div>
+      </div>`
+          )
+          .join('')
+      : '<p class="sin-datos">No hay solicitudes pendientes.</p>';
+
+    abrirModal(`
+      <h2>Solicitudes del mostrador</h2>
+      <p class="muted small">Aplicar un cambio escribe la tarifa y queda en el historial.</p>
+      <div class="sol-lista">${filas}</div>
+      <div class="modal-acciones">
+        <button class="btn btn-outline" type="button" data-accion="cerrar">Cerrar</button>
+      </div>
+    `);
+
+  }
+
+  function aplicarSolicitud(id) {
+    const solicitud = Store.getSolicitudes().find((s) => s.id === id);
+    if (!solicitud) return;
+
+    const previos = Store.getPrecios();
+    const mapa = {};
+    CONFIG.servicios.forEach((servicio) => {
+      mapa[servicio.id] = tarifaDe(servicio, previos);
+    });
+    mapa[solicitud.servicioId] = redondear(parseNum(solicitud.precioPedido));
+
+    Store.setPrecios(mapa);
+    registrarCambiosPrecios(previos, mapa, { motivo: 'admin' });
+    Store.resolverSolicitud(id, {
+      estado: 'aprobada',
+      resueltaPor: (estado.operador && estado.operador.nombre) || 'Administrador'
+    });
+
+    estado.items.forEach((item) => {
+      const servicio = CONFIG.servicios.find((s) => s.id === item.servicioId);
+      if (!servicio) return;
+      if (Number(item.tarifa) === Number(tarifaDe(servicio, previos))) item.tarifa = mapa[servicio.id];
+    });
+
+    renderCatalogo();
+    renderItems();
+    refrescarResumen();
+    cerrarModal();
+    abrirPrecios();
+    toast(`Precio de ${solicitud.servicio} actualizado a ${money(mapa[solicitud.servicioId])}`);
+  }
+
+  function rechazarSolicitud(id) {
+    Store.resolverSolicitud(id, {
+      estado: 'rechazada',
+      resueltaPor: (estado.operador && estado.operador.nombre) || 'Administrador'
+    });
+    cerrarModal();
+    abrirSolicitudes();
+  }
+
+  function abrirHistorial() {
+    if (!esAdmin()) return;
+    const entradas = Store.getAuditoria().slice(0, 40);
+    const filas = entradas.length
+      ? entradas
+          .map((e) => {
+            const detalle = e.cambios && e.cambios.length
+              ? e.cambios.map((c) => `${esc(c.servicio)}: ${money(c.antes)} → ${money(c.despues)}`).join('<br>')
+              : esc(e.detalle || '');
+            return `<div class="sol-item solo-info">
+              <div class="sol-info">
+                <strong>${esc(e.operador || 'Operador')} · ${e.via === 'admin' ? 'administración' : 'con código'}</strong>
+                <span>${esc((e.fecha || '').slice(0, 16).replace('T', ' '))}${e.codigo ? ` · código ${esc(e.codigo)}` : ''}</span>
+                <small>${detalle}</small>
+              </div>
+            </div>`;
+          })
+          .join('')
+      : '<p class="sin-datos">Todavía no hay cambios de tarifa registrados.</p>';
+
+    abrirModal(`
+      <h2>Historial de cambios de tarifa</h2>
+      <p class="muted small">Últimos 40 movimientos, con el código usado si lo hubo.</p>
+      <div class="sol-lista">${filas}</div>
+      <div class="modal-acciones">
+        <button class="btn btn-outline" type="button" data-accion="cerrar">Cerrar</button>
+      </div>
+    `);
+  }
+
+  /* --------------------------- Carrito / ítems -------------------------- */
+
+  function agregarServicio(idServicio) {
+    const servicio = CONFIG.servicios.find((s) => s.id === idServicio);
+    if (!servicio) return;
+
+    const existente = estado.items.find((i) => i.servicioId === idServicio);
+
+    if (existente && servicio.tipo === 'unidad') {
+      existente.cantidad = Number(existente.cantidad) + 1;
+      renderItems();
+      refrescarResumen();
+      return;
+    }
+
+    if (existente && servicio.tipo === 'peso') {
+      const input = $(`.item[data-key="${existente.key}"] input[data-campo="cantidad"]`);
+      if (input) {
+        input.focus();
+        input.select();
+      }
+      toast('Escribe el peso en kilos para este servicio');
+      return;
+    }
+
+    // El peso se escribe en la propia fila: arranca vacío, no con el mínimo.
+    const cantidad = servicio.tipo === 'peso' ? 0 : 1;
+    const clave = uid('it');
+
+    estado.items.push({
+      key: clave,
+      servicioId: servicio.id,
+      nombre: servicio.nombre,
+      tipo: servicio.tipo,
+      unidad: servicio.unidad,
+      cantidad,
+      tarifa: tarifaDe(servicio),
+      minPeso: servicio.minPeso || 0
+    });
+
+    renderItems();
+    refrescarResumen();
+    // Se deja el cursor en los kilos para escribir el peso de inmediato.
+    if (servicio.tipo === 'peso') {
+      const campo = $(`.item[data-key="${clave}"] input[data-campo="cantidad"]`);
+      if (campo) {
+        campo.focus();
+        campo.select();
+      }
+    }
+    toast(`${servicio.nombre} agregado`);
+  }
+
+  function calcularItem(item) {
+    const cantidad = Math.max(0, parseNum(item.cantidad));
+    const tarifa = Math.max(0, parseNum(item.tarifa));
+    const base = item.tipo === 'peso' && item.minPeso && cantidad > 0 ? Math.max(cantidad, item.minPeso) : cantidad;
+    return { base, subtotal: redondear(base * tarifa) };
+  }
+
+  function renderItems() {
+    const contenedor = $('#items');
+    if (!estado.items.length) {
+      contenedor.innerHTML = '';
+      $('#itemsVacio').classList.remove('oculto');
+      return;
+    }
+    $('#itemsVacio').classList.add('oculto');
+
+    contenedor.innerHTML = estado.items
+      .map((item) => {
+        const esPeso = item.tipo === 'peso';
+        const cantidad = parseNum(item.cantidad);
+        const nota =
+          esPeso && item.minPeso && cantidad > 0 && cantidad < item.minPeso
+            ? `<p class="item-note">Se aplica el mínimo de ${item.minPeso} kg para este servicio.</p>`
+            : '';
+        return `<div class="item" data-key="${item.key}">
+          <div class="item-info">
+            <span class="item-name">${esc(item.nombre)}</span>
+            <span class="tag ${esPeso ? 'peso' : ''}">${esPeso ? 'Por peso' : 'Por unidad'}</span>
+          </div>
+          <div class="item-cant">
+            <label for="cant-${item.key}">${esPeso ? 'Peso (kg)' : `Cantidad (${esc(item.unidad)})`}</label>
+            <input id="cant-${item.key}" type="number" data-campo="cantidad" value="${item.cantidad}" min="0" step="${esPeso ? '0.01' : '1'}" inputmode="decimal" placeholder="${esPeso ? '0.00' : '1'}" />
+          </div>
+          <div class="item-tarifa">
+            <label for="tar-${item.key}">${esPeso ? 'S/ por kg' : 'Precio'}</label>
+            <input id="tar-${item.key}" type="number" data-campo="tarifa" value="${(Number(item.tarifa) || 0).toFixed(2)}" min="0" step="0.01" inputmode="decimal" />
+          </div>
+          <div class="item-sub"><span>Subtotal</span><strong data-subtotal>${money(calcularItem(item).subtotal)}</strong></div>
+          <button class="icon-btn" type="button" data-accion="quitar" aria-label="Quitar ${esc(item.nombre)}">&times;</button>
+          ${nota}
+        </div>`;
+      })
+      .join('');
+  }
+
+  function refrescarSubtotales() {
+    $$('#items .item').forEach((fila) => {
+      const item = estado.items.find((i) => i.key === fila.dataset.key);
+      if (!item) return;
+      const celda = $('[data-subtotal]', fila);
+      if (celda) celda.textContent = money(calcularItem(item).subtotal);
+    });
+  }
+
+  function calcularTotales() {
+    let subtotal = 0;
+    let peso = 0;
+    let prendas = 0;
+
+    estado.items.forEach((item) => {
+      subtotal += calcularItem(item).subtotal;
+      if (item.tipo === 'peso') peso += Math.max(0, parseNum(item.cantidad));
+      else prendas += Math.max(0, parseNum(item.cantidad));
+    });
+
+    subtotal = redondear(subtotal);
+    const descuento = Math.min(Math.max(parseNum($('#descuento').value), 0), subtotal);
+    const envio = $('#tipoEntrega').value === 'domicilio' ? Math.max(0, parseNum($('#costoEnvio').value)) : 0;
+
+    return {
+      subtotal,
+      descuento: redondear(descuento),
+      envio: redondear(envio),
+      total: redondear(subtotal - descuento + envio),
+      peso: redondear(peso),
+      prendas
+    };
+  }
+
+  /* -------------------------------- Pago -------------------------------- */
+
+  const ETIQUETAS_PAGO = {
+    pagado: { nombre: 'Pagado', clase: 'ok' },
+    adelanto: { nombre: 'Adelanto', clase: 'warn' },
+    pendiente: { nombre: 'Por cobrar', clase: 'neutral' },
+    'sin-registro': { nombre: 'Sin registro', clase: 'info' }
+  };
+
+  /** Normaliza el pago de una orden; las órdenes antiguas no tienen el campo. */
+  function datosPago(orden) {
+    const total = redondear(Number(orden.total) || 0);
+    const guardado = orden.pago;
+    if (!guardado || !guardado.estado) {
+      return { estado: 'sin-registro', metodo: orden.formaPago || '—', monto: 0, saldo: total, movimientos: [] };
+    }
+    const monto = redondear(Math.min(Math.max(Number(guardado.monto) || 0, 0), total));
+    return {
+      estado: guardado.estado,
+      metodo: guardado.metodo || orden.formaPago || '—',
+      monto,
+      saldo: redondear(total - monto),
+      movimientos: Array.isArray(guardado.movimientos) ? guardado.movimientos : []
+    };
+  }
+
+  function etiquetaPago(estado) {
+    return ETIQUETAS_PAGO[estado] || ETIQUETAS_PAGO.pendiente;
+  }
+
+  /** Badge compacto para tablas: Pagado / Adelanto · saldo / Por cobrar. */
+  function badgePago(orden) {
+    const pago = datosPago(orden);
+    if (pago.estado === 'sin-registro') return '';
+    const def = etiquetaPago(pago.estado);
+    const deuda = pago.estado === 'adelanto' && pago.saldo > 0
+      ? `<br><span class="muted small">Debe ${money(pago.saldo)}</span>`
+      : '';
+    return `<span class="estado ${def.clase}">${esc(def.nombre)}</span>${deuda}`;
+  }
+
+  /** Lee el bloque de pago del formulario y lo normaliza contra el total. */
+  function calcularPago(total) {
+    const estadoElegido = $('#estadoPago').value || 'pendiente';
+    const metodo = $('#formaPago').value || CONFIG.pagos[0];
+    let monto = 0;
+
+    if (estadoElegido === 'pagado') monto = total;
+    else if (estadoElegido === 'adelanto') monto = Math.min(Math.max(parseNum($('#montoAdelanto').value), 0), total);
+
+    monto = redondear(monto);
+    const saldo = redondear(total - monto);
+
+    // Un adelanto que cubre todo el total es un pago completo; un adelanto de 0 es "por cobrar".
+    let estado = estadoElegido;
+    if (estadoElegido === 'adelanto') {
+      if (saldo <= 0) estado = 'pagado';
+      else if (monto <= 0) estado = 'pendiente';
+    }
+
+    return { estado, estadoElegido, metodo, monto, saldo };
+  }
+
+  function refrescarResumen() {
+    const totales = calcularTotales();
+    $('#sumPrendas').textContent = String(totales.prendas);
+    $('#sumPeso').textContent = `${totales.peso.toFixed(2)} kg`;
+    $('#sumSubtotal').textContent = money(totales.subtotal);
+    $('#sumDescuento').textContent = money(totales.descuento);
+    $('#sumEnvio').textContent = money(totales.envio);
+    $('#filaEnvio').classList.toggle('oculto', totales.envio <= 0);
+    $('#sumTotal').textContent = money(totales.total);
+    $('#resumenCodigo').textContent = Store.nextOrderCode();
+    refrescarPago(totales.total);
+    actualizarAviso();
+  }
+
+  function refrescarPago(total) {
+    const pago = calcularPago(total);
+    const esAdelanto = $('#estadoPago').value === 'adelanto';
+
+    $('#campoAdelanto').classList.toggle('oculto', !esAdelanto);
+    $('#sumPagado').textContent = money(pago.monto);
+    $('#sumSaldo').textContent = money(pago.saldo);
+
+    const chip = $('#pagoEstadoChip');
+    const def = etiquetaPago(pago.estado);
+    chip.textContent = def.nombre;
+    chip.className = `estado ${def.clase}`;
+
+    if (esAdelanto) {
+      $('#adelantoHint').textContent = pago.saldo > 0
+        ? `Queda un saldo de ${money(pago.saldo)} por cobrar.`
+        : 'El adelanto cubre el total: se registra como pagado.';
+    }
+  }
+
+  /* ------------------------------- Recojo ------------------------------- */
+
+  function fechaRecojo() {
+    const valor = $('#recojo').value;
+    if (!valor) return null;
+    const fecha = new Date(valor);
+    return Number.isNaN(fecha.getTime()) ? null : fecha;
+  }
+
+  const DIAS_CORTOS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+  const MESES_CORTOS = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'set', 'oct', 'nov', 'dic'];
+
+  /** Fecha a medianoche: comparar días sin arrastrar horas. */
+  function soloDia(fecha) {
+    const dia = new Date(fecha);
+    dia.setHours(0, 0, 0, 0);
+    return dia;
+  }
+
+  function isoDia(fecha) {
+    const dia = soloDia(fecha);
+    return `${dia.getFullYear()}-${String(dia.getMonth() + 1).padStart(2, '0')}-${String(dia.getDate()).padStart(2, '0')}`;
+  }
+
+  function sumarDias(fecha, dias) {
+    const nueva = new Date(fecha);
+    nueva.setDate(nueva.getDate() + dias);
+    return nueva;
+  }
+
+  /** Días de calendario que dura el proceso (0 = listo hoy mismo). */
+  function diasDeProceso() {
+    const recojo = fechaRecojo();
+    if (!recojo) return 0;
+    return Math.max(0, Math.round((soloDia(recojo) - soloDia(new Date())) / 86400000));
+  }
+
+  function textoDias(dias) {
+    if (dias <= 0) return 'mismo día';
+    return dias === 1 ? '1 día' : `${dias} días`;
+  }
+
+  /** Etiqueta del proceso según el día elegido en la tira. */
+  function procesoDeDias(dias) {
+    if (dias <= 0) return { id: 'express', nombre: 'Mismo día' };
+    if (dias === 1) return { id: 'normal', nombre: '24 horas' };
+    if (dias === 2) return { id: 'dosdias', nombre: '48 horas' };
+    if (dias === 3) return { id: 'tresdias', nombre: '72 horas' };
+    return { id: 'normal', nombre: `${dias} días` };
+  }
+
+  /** Pinta la semana visible: hoy primero, el día de recojo resaltado y los
+      días intermedios marcados como proceso. */
+  function renderSemana() {
+    const hoy = soloDia(new Date());
+    const inicio = sumarDias(hoy, estado.offsetSemana);
+    const recojo = fechaRecojo();
+    const diaRecojo = recojo ? soloDia(recojo) : null;
+
+    const dias = Array.from({ length: 7 }, (_, i) => sumarDias(inicio, i));
+    const primero = dias[0];
+    const ultimo = dias[dias.length - 1];
+
+    $('#semanaRango').textContent = primero.getMonth() === ultimo.getMonth()
+      ? `${primero.getDate()} – ${ultimo.getDate()} de ${MESES_CORTOS[primero.getMonth()]}`
+      : `${primero.getDate()} ${MESES_CORTOS[primero.getMonth()]} – ${ultimo.getDate()} ${MESES_CORTOS[ultimo.getMonth()]}`;
+
+    $('#semana').innerHTML = dias.map((dia) => {
+      const iso = isoDia(dia);
+      const esHoy = dia.getTime() === hoy.getTime();
+      const seleccionado = Boolean(diaRecojo) && dia.getTime() === diaRecojo.getTime();
+      const enProceso = Boolean(diaRecojo) && dia > hoy && dia < diaRecojo;
+
+      const clases = ['dia'];
+      if (esHoy) clases.push('es-hoy');
+      if (enProceso) clases.push('en-proceso');
+      if (seleccionado) clases.push('seleccionado');
+
+      const etiqueta = seleccionado
+        ? (esHoy ? 'Hoy · listo' : 'Listo')
+        : (esHoy ? 'Hoy' : (enProceso ? 'Proceso' : ''));
+
+      return `
+        <button type="button" class="${clases.join(' ')}" data-dia="${iso}" aria-pressed="${seleccionado}"
+                title="${DIAS_CORTOS[dia.getDay()]} ${dia.getDate()} ${MESES_CORTOS[dia.getMonth()]}">
+          <span class="dia-nom">${DIAS_CORTOS[dia.getDay()]}</span>
+          <span class="dia-num">${dia.getDate()}</span>
+          <span class="dia-mes">${MESES_CORTOS[dia.getMonth()]}</span>
+          ${etiqueta ? `<span class="dia-tag">${etiqueta}</span>` : ''}
+        </button>`;
+    }).join('');
+
+    // Si el día elegido quedó fuera de la semana que se está viendo,
+    // ofrecemos volver a él en vez de dejar la tira sin selección.
+    const visible = Boolean(diaRecojo) && dias.some((d) => d.getTime() === diaRecojo.getTime());
+    const fuera = $('#semanaFuera');
+    if (fuera) {
+      if (diaRecojo && !visible) {
+        fuera.innerHTML = `<button type="button" class="semana-volver" id="semanaVolver">Elegido: ${esc(fechaAviso(diaRecojo).dia)} · volver a esa semana</button>`;
+        fuera.classList.remove('oculto');
+      } else {
+        fuera.innerHTML = '';
+        fuera.classList.add('oculto');
+      }
+    }
+
+    $('#semanaPrev').disabled = estado.offsetSemana <= 0;
+  }
+
+  function actualizarHintRecojo(sugerido) {
+    const recojo = fechaRecojo();
+    if (!recojo) {
+      $('#recojoHint').textContent = '';
+      return;
+    }
+    const { dia, hora } = fechaAviso(recojo);
+    const prefijo = sugerido ? 'Sugerido: ' : '';
+    $('#recojoHint').textContent = `${prefijo}${procesoActual().nombre} · listo el ${dia} a las ${hora}`;
+  }
+
+  /** El operador elige el día tocando la tarjeta. */
+  function seleccionarDia(iso) {
+    const hora = $('#horaRecojo').value || '08:00';
+    $('#recojo').value = `${iso}T${hora}`;
+    estado.recojoManual = true;
+    // Elegir el día a mano manda sobre el proceso sugerido.
+    estado.procesoSel = null;
+    renderProcesos();
+    renderSemana();
+    actualizarHintRecojo(false);
+    actualizarAviso();
+  }
+
+  /** Sin fecha propuesta: el operador elige el día en la tira.
+      Hasta que lo haga, la app no anuncia ningún recojo. */
+  function limpiarRecojo() {
+    $('#recojo').value = '';
+    estado.offsetSemana = 0;
+    estado.recojoManual = false;
+    $('#horaRecojo').value = '08:00';
+    renderSemana();
+    $('#recojoHint').textContent = 'Elige el día de recojo en la tira';
+    actualizarAviso();
+  }
+
+  function esDomicilio() {
+    return $('#tipoEntrega').value === 'domicilio';
+  }
+
+  function actualizarEntrega() {
+    const domicilio = esDomicilio();
+    $('#campoDireccion').classList.toggle('oculto', !domicilio);
+    $('#campoCostoEnvio').classList.toggle('oculto', !domicilio);
+    refrescarResumen();
+  }
+
+  function actualizarAviso() {
+    const fecha = fechaRecojo();
+    const caja = $('#recojoBox');
+    const aviso = $('#avisoPreview');
+    const nombre = $('#cliNombre').value.trim() || 'cliente';
+    const domicilio = esDomicilio();
+    const direccion = $('#direccionEntrega').value.trim();
+    const lugar = domicilio ? direccion || 'la dirección indicada' : CONFIG.negocio.direccion;
+
+    if (!fecha) {
+      caja.innerHTML = '<div><strong>Sin fecha de recojo</strong><p>Elige el día y la hora de entrega.</p></div>';
+      aviso.className = 'aviso-preview pendiente';
+      aviso.innerHTML = '<p class="eyebrow">Aviso al cliente</p><p>Selecciona la fecha y hora de recojo para generar el aviso.</p>';
+      return;
+    }
+
+    const { dia, hora, corta } = fechaAviso(fecha);
+    caja.innerHTML = domicilio
+      ? `<div><strong>Envío el ${esc(dia)}</strong><p>Desde las ${esc(hora)} · ${esc(lugar)}</p></div>`
+      : `<div><strong>Listo el ${esc(dia)}</strong><p>Desde las ${esc(hora)} · ${esc(lugar)}</p></div>`;
+
+    const frase = domicilio
+      ? `entregaremos tus prendas en ${esc(lugar)}`
+      : `tus prendas estarán listas`;
+
+    // Se anuncia el proceso realmente elegido (Express, Normal, 48 h…).
+    const proceso = `Proceso ${procesoActual().nombre}`;
+
+    aviso.className = 'aviso-preview';
+    aviso.innerHTML = `<p class="eyebrow">Aviso al cliente</p>
+      <p>Hola ${esc(nombre)}, ${frase} el <strong>${esc(dia)}</strong> desde las <strong>${esc(hora)}</strong></p>
+      <p class="hint" style="margin-top:6px">${esc(proceso)} · programado: ${esc(corta)}</p>`;
+  }
+
+  /* ------------------------------- Cliente ------------------------------ */
+
+  function actualizarCodigoCliente() {
+    const existente = estado.clienteExistente;
+    const codigo = existente ? existente.codigo : Store.nextClienteCode();
+    estado.clienteCodigo = codigo;
+    $('#cliCodigo').value = codigo;
+    $('#cliCodigoChip').textContent = codigo;
+  }
+
+  function buscarCliente() {
+    const telefono = $('#cliTelefono').value.trim();
+    const encontrado = Store.buscarPorTelefono(telefono);
+    const banner = $('#clienteEncontrado');
+
+    if (encontrado) {
+      estado.clienteExistente = encontrado;
+      $('#cliNombre').value = encontrado.nombre || $('#cliNombre').value;
+      $('#cliEmail').value = encontrado.email || $('#cliEmail').value;
+      const stats = Store.statsCliente(encontrado);
+      banner.classList.remove('oculto');
+      banner.innerHTML = `<span class="badge">Cliente registrado</span>
+        <strong>${esc(encontrado.nombre)}</strong>
+        <span class="muted">${esc(encontrado.codigo)} · ${stats.ordenes} servicio(s) · ${money(stats.total)} acumulado</span>`;
+      // Editar la ficha de un cliente ya registrado es cosa de administración.
+      const soloLectura = !esAdmin();
+      ['#cliNombre', '#cliEmail'].forEach((sel) => {
+        const campo = $(sel);
+        campo.readOnly = soloLectura;
+        campo.classList.toggle('solo-lectura', soloLectura);
+      });
+      $('#cliHint').textContent = soloLectura
+        ? 'Datos del cliente registrado. Solo el administrador puede cambiarlos.'
+        : 'Datos cargados desde la base de clientes.';
+      $('#cliHint').classList.add('ok');
+    } else {
+      estado.clienteExistente = null;
+      ['#cliNombre', '#cliEmail'].forEach((sel) => {
+        const campo = $(sel);
+        campo.readOnly = false;
+        campo.classList.remove('solo-lectura');
+      });
+      banner.classList.add('oculto');
+      banner.innerHTML = '';
+      $('#cliHint').textContent = 'Cliente nuevo: se registrará con el código generado.';
+      $('#cliHint').classList.remove('ok');
+    }
+    actualizarCodigoCliente();
+  }
+
+  /* --------------------------- Asistente de pasos ------------------------ */
+
+  /* Cuatro pasos: cliente → recepción y prendas → proceso y recojo → envío.
+     Recepción y prendas van juntos porque el peso o el conteo se toman con la
+     bolsa delante del cliente y de ahí sale el servicio. */
+  const TOTAL_PASOS = 4;
+
+  /** Pinta el paso indicado (sin validar): barra, panel y scroll. */
+  function pintarPaso(n) {
+    const objetivo = Math.max(1, Math.min(TOTAL_PASOS, Number(n) || 1));
+    estado.paso = objetivo;
+
+    $$('#pasosNav .paso-tab').forEach((tab) => {
+      const num = Number(tab.dataset.ir);
+      tab.classList.toggle('is-active', num === objetivo);
+      tab.classList.toggle('is-done', num < objetivo);
+      if (num === objetivo) tab.setAttribute('aria-current', 'step');
+      else tab.removeAttribute('aria-current');
+    });
+
+    $$('#vista-nuevo .paso-panel').forEach((panel) => {
+      panel.classList.toggle('is-active', Number(panel.dataset.paso) === objetivo);
+    });
+
+    if (objetivo === 3) renderProcesos();
+    if (objetivo === 4) renderResumenFinal();
+
+    const vista = $('#vista-nuevo');
+    if (vista && vista.classList.contains('is-active')) {
+      window.scrollTo({ top: Math.max(0, vista.offsetTop - 90), behavior: 'smooth' });
+    }
+  }
+
+  /** Avanza solo si el paso actual está completo; retroceder es libre. */
+  function irAPaso(destino) {
+    const objetivo = Math.max(1, Math.min(TOTAL_PASOS, Number(destino) || 1));
+    if (objetivo > estado.paso) {
+      for (let p = estado.paso; p < objetivo; p += 1) {
+        if (!esPasoValido(p)) {
+          pintarPaso(p);
+          return false;
+        }
+      }
+    }
+    pintarPaso(objetivo);
+    return true;
+  }
+
+  /** Cada paso se confirma con su propio botón: se valida lo suyo y nada más. */
+  function esPasoValido(n) {
+    if (n === 1) {
+      const telefono = $('#cliTelefono').value.replace(/\D/g, '');
+      const nombre = $('#cliNombre').value.trim();
+      const email = $('#cliEmail').value.trim();
+      if (telefono.length < 6) {
+        marcarInvalido('#cliTelefono');
+        toast('Ingresa un teléfono válido del cliente');
+        return false;
+      }
+      if (nombre.length < 3) {
+        marcarInvalido('#cliNombre');
+        toast('Ingresa el nombre del cliente');
+        return false;
+      }
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        marcarInvalido('#cliEmail');
+        toast('El correo no tiene un formato válido');
+        return false;
+      }
+      return true;
+    }
+
+    /* Paso 2 = recepción y prendas: cada renglón necesita su peso o su cantidad. */
+    if (n === 2) {
+      if (!estado.items.length) {
+        toast('Agrega al menos un servicio del catálogo');
+        return false;
+      }
+      const pesoSinDato = estado.items.find((i) => i.tipo === 'peso' && parseNum(i.cantidad) <= 0);
+      if (pesoSinDato) {
+        const campo = $(`.item[data-key="${pesoSinDato.key}"] input[data-campo="cantidad"]`);
+        if (campo) campo.focus();
+        toast(`Escribe el peso de «${pesoSinDato.nombre}»`);
+        return false;
+      }
+      const prendaSinDato = estado.items.find((i) => i.tipo !== 'peso' && parseNum(i.cantidad) < 1);
+      if (prendaSinDato) {
+        const campo = $(`.item[data-key="${prendaSinDato.key}"] input[data-campo="cantidad"]`);
+        if (campo) campo.focus();
+        toast(`Escribe cuántas prendas van en «${prendaSinDato.nombre}»`);
+        return false;
+      }
+      return true;
+    }
+
+    if (n === 3) {
+      const fecha = fechaRecojo();
+      if (!fecha) {
+        marcarSemanaInvalida();
+        toast('Elige el día de recojo en la tira');
+        return false;
+      }
+      if (fecha.getTime() < Date.now() - 5 * 60 * 1000) {
+        marcarSemanaInvalida();
+        toast('La fecha de recojo ya pasó, elige otra');
+        return false;
+      }
+      if (esDomicilio() && $('#direccionEntrega').value.trim().length < 5) {
+        marcarInvalido('#direccionEntrega');
+        toast('Escribe la dirección del envío a domicilio');
+        return false;
+      }
+      return true;
+    }
+
+    return true;
+  }
+
+  /** Recepción: por peso (kilos) o por conteo (prendas). */
+  function seleccionarModoRecepcion(modo) {
+    estado.recepcion.modo = modo === 'unidad' ? 'unidad' : 'peso';
+    $$('#recepcionModos .modo-card').forEach((boton) => {
+      const activo = boton.dataset.modo === estado.recepcion.modo;
+      boton.classList.toggle('is-active', activo);
+      boton.setAttribute('aria-checked', String(activo));
+    });
+    renderCatalogo();
+  }
+
+  /** Proceso vigente: el elegido a mano o el que se deduce del día de recojo. */
+  function procesoActual() {
+    if (estado.procesoSel) return estado.procesoSel;
+    return procesoDeDias(diasDeProceso());
+  }
+
+  function renderProcesos() {
+    const contenedor = $('#procesoChips');
+    if (!contenedor) return;
+    contenedor.innerHTML = CONFIG.tiempos
+      .map((tiempo) => {
+        const activo = Boolean(estado.procesoSel) && estado.procesoSel.id === tiempo.id;
+        return `<button class="proceso-chip${activo ? ' is-active' : ''}" type="button" data-proceso="${tiempo.id}" aria-pressed="${activo}">
+          <strong>${esc(tiempo.nombre)}</strong>
+        </button>`;
+      })
+      .join('');
+  }
+
+  /** Elegir proceso calcula la fecha de recojo y la deja seleccionada. */
+  function elegirProceso(id) {
+    const tiempo = CONFIG.tiempos.find((t) => t.id === id);
+    if (!tiempo) return;
+
+    estado.procesoSel = tiempo;
+    const listo = calcularListo(new Date(), tiempo.horas);
+    const iso = isoDia(listo);
+    const hora = `${String(listo.getHours()).padStart(2, '0')}:${String(listo.getMinutes()).padStart(2, '0')}`;
+
+    estado.recojoManual = false;
+    $('#horaRecojo').value = hora;
+    $('#recojo').value = `${iso}T${hora}`;
+
+    const dias = Math.round((soloDia(listo) - soloDia(new Date())) / 86400000);
+    estado.offsetSemana = Math.max(0, Math.floor(dias / 7) * 7);
+
+    renderSemana();
+    renderProcesos();
+    actualizarHintRecojo(true);
+    actualizarAviso();
+    refrescarResumen();
+  }
+
+  /** Resumen del paso 5: lo que verá el operador antes de confirmar. */
+  function renderResumenFinal() {
+    const caja = $('#resumenFinal');
+    if (!caja) return;
+
+    const totales = calcularTotales();
+    const pago = calcularPago(totales.total);
+    const recojo = fechaRecojo();
+    const proceso = procesoActual();
+    const nombre = $('#cliNombre').value.trim() || 'Cliente';
+    const telefono = $('#cliTelefono').value.trim();
+    const codigo = estado.clienteExistente ? estado.clienteExistente.codigo : $('#cliCodigo').value || Store.nextClienteCode();
+    const domicilio = esDomicilio();
+    const aviso = recojo ? fechaAviso(recojo) : { dia: 'sin fecha', hora: '' };
+
+    const filas = estado.items
+      .map(
+        (item) => `<div class="recibo-fila">
+          <span>${esc(item.nombre)}${item.tipo === 'peso' ? ` · ${Number(parseNum(item.cantidad)).toFixed(2)} kg` : ` × ${item.cantidad}`}</span>
+          <strong>${money(calcularItem(item).subtotal)}</strong>
+        </div>`
+      )
+      .join('');
+
+    caja.innerHTML = `
+      <div class="recibo-head">
+        <div>
+          <p class="eyebrow">Cliente</p>
+          <strong>${esc(nombre)}</strong>
+          <span class="muted small">${esc(codigo)} · ${esc(telefono)}</span>
+        </div>
+        <div class="recibo-total">
+          <span>Total a pagar</span>
+          <strong>${money(totales.total)}</strong>
+        </div>
+      </div>
+
+      <div class="recibo-bloque">
+        <p class="eyebrow">Prendas recibidas</p>
+        ${filas || '<p class="muted small">Sin prendas agregadas.</p>'}
+        <p class="muted small">${[
+          totales.prendas > 0 ? `${totales.prendas} prenda(s)` : '',
+          totales.peso > 0 ? `${Number(totales.peso).toFixed(2)} kg` : '',
+          estado.recepcion.modo === 'peso' ? 'recibido por peso' : 'recibido por conteo'
+        ].filter(Boolean).join(' · ')}</p>
+        ${totales.descuento > 0 ? `<p class="muted small">Descuento aplicado: ${money(totales.descuento)}</p>` : ''}
+        ${totales.envio > 0 ? `<p class="muted small">Envío a domicilio: ${money(totales.envio)}${$('#direccionEntrega').value.trim() ? ` · ${esc($('#direccionEntrega').value.trim())}` : ''}</p>` : ''}
+      </div>
+
+      <div class="recibo-bloque">
+        <p class="eyebrow">Proceso y recojo</p>
+        <strong>${esc(proceso.nombre)}</strong>
+        <p class="muted small">${domicilio ? 'Entrega a domicilio' : 'Recojo en tienda'} · ${esc(aviso.dia)} desde las ${esc(aviso.hora)}</p>
+      </div>
+
+      <div class="recibo-bloque">
+        <p class="eyebrow">Pago</p>
+        <strong>${esc(etiquetaPago(pago.estado).nombre)}</strong>
+        <p class="muted small">Pagado ${money(pago.monto)}${pago.metodo ? ` con ${esc(pago.metodo)}` : ''} · saldo ${money(pago.saldo)}</p>
+      </div>
+
+      ${$('#notas').value.trim() ? `<div class="recibo-bloque"><p class="eyebrow">Observaciones</p><p class="muted small">${esc($('#notas').value.trim())}</p></div>` : ''}
+    `;
+  }
+
+  /* ------------------------------ Validación ---------------------------- */
+
+  function marcarInvalido(selector) {
+    const campo = $(selector);
+    campo.classList.add('invalid');
+    campo.addEventListener('input', () => campo.classList.remove('invalid'), { once: true });
+    campo.focus();
+  }
+
+  /** Resalta la tira de días cuando falta elegir la fecha de recojo. */
+  function marcarSemanaInvalida() {
+    const caja = $('.semana');
+    if (!caja) return;
+    caja.classList.add('semana-invalida');
+    setTimeout(() => caja.classList.remove('semana-invalida'), 1800);
+    caja.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  function validar() {
+    const nombre = $('#cliNombre').value.trim();
+    const telefono = $('#cliTelefono').value.trim();
+    const digitos = telefono.replace(/\D/g, '');
+    const email = $('#cliEmail').value.trim();
+
+    if (digitos.length < 6) {
+      marcarInvalido('#cliTelefono');
+      toast('Ingresa un teléfono válido del cliente');
+      return false;
+    }
+    if (nombre.length < 3) {
+      marcarInvalido('#cliNombre');
+      toast('Ingresa el nombre del cliente');
+      return false;
+    }
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      marcarInvalido('#cliEmail');
+      toast('El correo no tiene un formato válido');
+      return false;
+    }
+    if (!estado.items.length) {
+      toast('Agrega al menos un servicio del catálogo');
+      return false;
+    }
+    const pesoSinDato = estado.items.find((i) => i.tipo === 'peso' && parseNum(i.cantidad) <= 0);
+    if (pesoSinDato) {
+      toast(`Ingresa el peso de «${pesoSinDato.nombre}»`);
+      return false;
+    }
+    const fecha = fechaRecojo();
+    if (!fecha) {
+      marcarSemanaInvalida();
+      toast('Elige el día de recojo en la tira');
+      return false;
+    }
+    if (fecha.getTime() < Date.now() - 5 * 60 * 1000) {
+      marcarSemanaInvalida();
+      toast('La fecha de recojo ya pasó, elige otra');
+      return false;
+    }
+    if (esDomicilio() && $('#direccionEntrega').value.trim().length < 5) {
+      marcarInvalido('#direccionEntrega');
+      toast('Escribe la dirección del envío a domicilio');
+      return false;
+    }
+    return true;
+  }
+
+  /* ---------------------------- Registrar orden ------------------------- */
+
+  /**
+   * Cierra el ingreso. `accion`: 'whatsapp' | 'imprimir' | 'ninguno'.
+   * Se acepta también true/false por compatibilidad con llamadas antiguas.
+   */
+  function registrar(accion) {
+    const cierre = accion === true ? 'whatsapp' : accion === false ? 'ninguno' : accion || 'whatsapp';
+    if (!validar()) return;
+
+    const totales = calcularTotales();
+    if (!(totales.total > 0)) {
+      toast('Atención: el total es S/ 0.00. Revisa las tarifas en «Precios».');
+    }
+    const pago = calcularPago(totales.total);
+    // El proceso guardado es el que se ve en el paso 3, no una deducción.
+    const proceso = procesoActual();
+    const recojo = fechaRecojo();
+    const nombre = $('#cliNombre').value.trim();
+    const telefono = $('#cliTelefono').value.trim();
+    const email = $('#cliEmail').value.trim();
+
+    /* El mostrador puede dar de alta clientes nuevos, pero no cambiar los
+       datos de uno que ya existe: eso queda para administración. */
+    const existente = Store.buscarPorTelefono(telefono);
+    const datosCliente = !esAdmin() && existente
+      ? { telefono: existente.telefono, nombre: existente.nombre, email: existente.email }
+      : { telefono, nombre, email };
+
+    const cliente = Store.upsertCliente(datosCliente);
+    const numeroServicio = Store.siguienteServicio(cliente.id, cliente.codigo);
+
+    const orden = Store.addOrden({
+      id: uid('ord'),
+      clienteId: cliente.id,
+      clienteCodigo: cliente.codigo,
+      servicioN: numeroServicio,
+      codigoServicio: `${cliente.codigo}-S${String(numeroServicio).padStart(2, '0')}`,
+      // Se guarda lo que quedó en la ficha, no lo que había escrito en pantalla.
+      cliente: { nombre: datosCliente.nombre, telefono: datosCliente.telefono, email: datosCliente.email },
+      items: estado.items.map((item) => ({
+        servicioId: item.servicioId,
+        nombre: item.nombre,
+        tipo: item.tipo,
+        unidad: item.unidad,
+        cantidad: redondear(parseNum(item.cantidad)),
+        tarifa: redondear(parseNum(item.tarifa)),
+        subtotal: calcularItem(item).subtotal
+      })),
+      pesoTotal: totales.peso,
+      prendas: totales.prendas,
+      subtotal: totales.subtotal,
+      descuento: totales.descuento,
+      total: totales.total,
+      ingreso: new Date().toISOString(),
+      proceso: proceso.id,
+      procesoNombre: proceso.nombre,
+      recojoEn: recojo.toISOString(),
+      formaPago: pago.metodo,
+      pago: {
+        estado: pago.estado,
+        metodo: pago.metodo,
+        monto: pago.monto,
+        saldo: pago.saldo,
+        movimientos: pago.monto > 0
+          ? [{
+              fecha: new Date().toISOString(),
+              monto: pago.monto,
+              metodo: pago.metodo,
+              tipo: pago.estado === 'pagado' ? 'completo' : 'adelanto',
+              operador: estado.operador ? estado.operador.nombre : 'Operador'
+            }]
+          : []
+      },
+      notas: $('#notas').value.trim(),
+      entrega: {
+        tipo: esDomicilio() ? 'domicilio' : 'tienda',
+        direccion: esDomicilio() ? $('#direccionEntrega').value.trim() : '',
+        costo: totales.envio
+      },
+      listoEn: null,
+      entregadoEn: null,
+      recordatorioEn: null,
+      ultimoAvisoEn: null,
+      almacen: null,
+      estado: 'recibido',
+      operador: estado.operador ? estado.operador.nombre : 'Operador'
+    });
+
+    estado.ordenActual = orden;
+    limpiarFormulario();
+    renderOrdenes();
+    renderClientes();
+    renderResumen();
+    renderBanner();
+
+    if (cierre === 'whatsapp') {
+      enviarComprobante(orden, 'registro');
+    } else {
+      abrirModalExito(orden);
+      if (cierre === 'imprimir') imprimirOrden(orden);
+    }
+  }
+
+  function limpiarFormulario() {
+    estado.items = [];
+    estado.clienteExistente = null;
+    ['#cliTelefono', '#cliNombre', '#cliEmail', '#notas', '#direccionEntrega'].forEach((sel) => {
+      $(sel).value = '';
+      $(sel).classList.remove('invalid');
+    });
+    $('#descuento').value = '0.00';
+    $('#tipoEntrega').value = 'tienda';
+    $('#costoEnvio').value = '0.00';
+    $('#estadoPago').value = 'pendiente';
+    $('#montoAdelanto').value = '0.00';
+    $('#campoDireccion').classList.add('oculto');
+    $('#campoCostoEnvio').classList.add('oculto');
+    $('#clienteEncontrado').classList.add('oculto');
+    $('#cliHint').textContent = 'Si el número ya está registrado, cargamos sus datos.';
+    $('#cliHint').classList.remove('ok');
+
+    // Vuelta al paso 1 con la recepción en blanco.
+      estado.recepcion = { modo: 'peso' };
+    estado.procesoSel = null;
+    estado.verTodos = false;
+    seleccionarModoRecepcion('peso');
+    renderProcesos();
+    pintarPaso(1);
+
+    renderItems();
+    actualizarCodigoCliente();
+    limpiarRecojo();
+    refrescarResumen();
+  }
+
+  /* ------------------------- Mensajes y WhatsApp ------------------------ */
+
+  function normalizarTelefono(telefono) {
+    let digitos = String(telefono || '').replace(/\D/g, '');
+    if (digitos.startsWith('00')) digitos = digitos.slice(2);
+    if (digitos.length === 9) digitos = CONFIG.negocio.codigoPais + digitos;
+    if (digitos.startsWith('0') && digitos.length > 9) digitos = CONFIG.negocio.codigoPais + digitos.slice(1);
+    return digitos;
+  }
+
+  function urlWhatsApp(orden, tipo = 'registro') {
+    return `https://wa.me/${normalizarTelefono(orden.cliente.telefono)}?text=${encodeURIComponent(construirMensaje(orden, tipo))}`;
+  }
+
+  function detalleItem(item) {
+    if (item.tipo === 'peso') {
+      return `${item.nombre} — ${Number(item.cantidad).toFixed(2)} kg x ${money(item.tarifa)}`;
+    }
+    return `${item.nombre} — ${item.cantidad} ${item.unidad} x ${money(item.tarifa)}`;
+  }
+
+  function datosEntrega(orden) {
+    const entrega = orden.entrega || {};
+    return {
+      domicilio: entrega.tipo === 'domicilio',
+      direccion: entrega.direccion || '',
+      costo: Number(entrega.costo) || 0
+    };
+  }
+
+  /**
+   * tipo: 'registro' (al ingresar) · 'listo' (prendas listas) · 'recordatorio' (día siguiente)
+   */
+  function construirMensaje(orden, tipo = 'registro') {
+    const { dia, hora } = fechaAviso(new Date(orden.recojoEn));
+    const { domicilio, direccion, costo } = datosEntrega(orden);
+    const lineas = [];
+
+    lineas.push(`${CONFIG.negocio.nombre.toUpperCase()} · ${CONFIG.negocio.rubro}`);
+
+    if (tipo === 'listo') lineas.push(`Hola ${orden.cliente.nombre}, tus prendas ya están listas.`);
+    else if (tipo === 'recordatorio') lineas.push(`Hola ${orden.cliente.nombre}, te recordamos que tus prendas te esperan.`);
+    else lineas.push(`Hola ${orden.cliente.nombre}, registramos tu servicio.`);
+
+    lineas.push('');
+    lineas.push(`Código de servicio: ${orden.codigo}`);
+    lineas.push(`Código de cliente: ${orden.clienteCodigo}`);
+
+    if (tipo === 'registro') {
+      lineas.push('');
+      lineas.push('DETALLE');
+      orden.items.forEach((item) => lineas.push(`• ${detalleItem(item)} — ${money(item.subtotal)}`));
+      lineas.push('');
+      if (orden.pesoTotal > 0) lineas.push(`Peso registrado: ${Number(orden.pesoTotal).toFixed(2)} kg`);
+      if (orden.descuento > 0) lineas.push(`Descuento: -${money(orden.descuento)}`);
+      if (costo > 0) lineas.push(`Envío a domicilio: ${money(costo)}`);
+    }
+
+    lineas.push(`TOTAL A PAGAR: ${money(orden.total)}`);
+
+    if (tipo === 'registro') {
+      const dias = Math.max(0, Math.round((soloDia(new Date(orden.recojoEn)) - soloDia(new Date(orden.ingreso))) / 86400000));
+      lineas.push(`PROCESO: ${dias <= 0 ? 'mismo día' : `${dias} ${dias === 1 ? 'día' : 'días'}`}`);
+    }
+
+    lineas.push('');
+
+    if (domicilio) {
+      lineas.push('ENTREGA A DOMICILIO');
+      lineas.push(direccion || 'Dirección por confirmar');
+      if (tipo === 'registro') lineas.push(`${capitalizar(dia)}, desde las ${hora}`);
+      else lineas.push('Coordinamos la entrega contigo.');
+    } else {
+      if (tipo === 'registro') {
+        lineas.push('LISTO PARA RECOGER');
+        lineas.push(`${capitalizar(dia)}, desde las ${hora}`);
+      } else {
+        lineas.push('YA PUEDES RECOGER');
+        if (orden.listoEn) lineas.push(`Listo desde el ${fechaAviso(new Date(orden.listoEn)).corta}`);
+      }
+      lineas.push(CONFIG.negocio.direccion);
+      lineas.push(`Horario: ${CONFIG.negocio.notaHorario}`);
+    }
+
+    lineas.push('');
+    if (tipo === 'recordatorio') {
+      lineas.push(`Seguimos guardando tus prendas con el código ${orden.codigo}.`);
+    } else {
+      lineas.push(`Conserva tu código ${orden.codigo} para recoger tus prendas.`);
+    }
+    lineas.push('¡Gracias por tu preferencia!');
+
+    return lineas.join('\n');
+  }
+
+  function tipoAvisoSugerido(orden) {
+    return orden.estado === 'listo' || orden.estado === 'almacen' ? 'listo' : 'registro';
+  }
+
+  /* ---------------------- Comprobante en imagen ------------------------- */
+
+  /**
+   * Genera el comprobante y lo comparte. En el celular abre la hoja de
+   * compartir de WhatsApp con la imagen adjunta; en la computadora muestra
+   * la vista previa para copiarla o descargarla.
+   */
+  async function enviarComprobante(orden, tipo = 'registro') {
+    if (!orden) return;
+    if (!window.Comprobante) {
+      toast('No se pudo cargar el generador de comprobantes');
+      return;
+    }
+
+    let salida;
+    try {
+      salida = await Comprobante.generar(orden, tipo);
+    } catch (error) {
+      toast('No se pudo generar la imagen del comprobante');
+      return;
+    }
+
+    const archivo = new File([salida.blob], salida.archivo, { type: 'image/png' });
+    if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+      try {
+        await navigator.share({ files: [archivo], text: Comprobante.texto(orden, tipo) });
+        liberarComprobanteAnterior();
+        estado.comprobante = null;
+        return;
+      } catch (error) {
+        if (error && error.name === 'AbortError') {
+          liberarComprobanteAnterior();
+          estado.comprobante = null;
+          return;
+        }
+        // Si el compartir falla, se sigue con la vista previa.
+      }
+    }
+
+    abrirModalComprobante(orden, tipo, salida);
+  }
+
+  function liberarComprobanteAnterior() {
+    if (estado.comprobante && estado.comprobante.url) {
+      URL.revokeObjectURL(estado.comprobante.url);
+    }
+  }
+
+  function abrirModalComprobante(orden, tipo, salida) {
+    liberarComprobanteAnterior();
+    estado.comprobante = { ...salida, ordenId: orden.id, tipo };
+
+    const telefono = normalizarTelefono(orden.cliente.telefono);
+    const enCelular = /android|iphone|ipad|ipod/i.test(navigator.userAgent);
+    const ayuda = enCelular
+      ? 'Si el teléfono no abrió WhatsApp solo, descarga la imagen y adjúntala en el chat.'
+      : 'Copia la imagen y pégala en el chat de WhatsApp con Ctrl + V, o descárgala y arrástrala.';
+
+    abrirModal(`
+      <p class="eyebrow">Comprobante listo</p>
+      <h2>${esc(orden.cliente.nombre)} · ${esc(orden.codigo)}</h2>
+      <p class="muted small">${esc(Comprobante.fechaLarga(orden.recojoEn))} desde las ${esc(Comprobante.horaCorta(orden.recojoEn))} · Total ${money(orden.total)}</p>
+
+      <div class="comprobante-vista">
+        <img src="${salida.url}" alt="Comprobante del servicio ${esc(orden.codigo)}" />
+      </div>
+
+      <p class="hint">${esc(ayuda)}</p>
+
+      <div class="modal-acciones">
+        <button class="btn btn-primary" type="button" data-accion="copiar-imagen">Copiar imagen</button>
+        <button class="btn btn-outline" type="button" data-accion="descargar-comprobante">Descargar PNG</button>
+        ${telefono.length >= 10 ? `<button class="btn btn-outline" type="button" data-accion="abrir-wa">Abrir el chat</button>` : ''}
+      </div>
+
+      <div class="modal-acciones" style="margin-top:10px">
+        <button class="btn btn-ghost" type="button" data-accion="imprimir" data-id="${esc(orden.id)}">Imprimir comprobante</button>
+        <button class="btn btn-ghost" type="button" data-accion="cerrar">Cerrar</button>
+      </div>
+    `);
+  }
+
+  async function copiarImagenComprobante() {
+    const actual = estado.comprobante;
+    if (!actual || !navigator.clipboard || !window.ClipboardItem) {
+      toast('Este navegador no permite copiar imágenes; usa Descargar PNG');
+      return;
+    }
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': actual.blob })]);
+      toast('Imagen copiada. Pégala en WhatsApp con Ctrl + V');
+    } catch (error) {
+      toast('No se pudo copiar la imagen; usa Descargar PNG');
+    }
+  }
+
+  function descargarComprobante() {
+    const actual = estado.comprobante;
+    if (!actual) return;
+    const enlace = document.createElement('a');
+    enlace.href = actual.url;
+    enlace.download = actual.archivo;
+    document.body.appendChild(enlace);
+    enlace.click();
+    enlace.remove();
+    toast('Comprobante descargado');
+  }
+
+  function abrirWhatsApp(orden, tipo = 'registro') {
+    if (!orden) return;
+    const telefono = normalizarTelefono(orden.cliente.telefono);
+    if (telefono.length < 10) {
+      toast('El teléfono del cliente no es válido para WhatsApp');
+      return;
+    }
+    const ventana = window.open(urlWhatsApp(orden, tipo), '_blank', 'noopener');
+    if (!ventana) toast('Habilita las ventanas emergentes para abrir WhatsApp');
+  }
+
+  async function copiarMensaje(orden) {
+    const texto = construirMensaje(orden);
+    try {
+      await navigator.clipboard.writeText(texto);
+      toast('Cuadro del mensaje copiado');
+    } catch (error) {
+      const area = document.createElement('textarea');
+      area.value = texto;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      try {
+        document.execCommand('copy');
+        toast('Cuadro del mensaje copiado');
+      } catch (err) {
+        toast('No se pudo copiar automáticamente; selecciona el texto del mensaje');
+      }
+      document.body.removeChild(area);
+    }
+  }
+
+  /* ------------------------------- Ticket ------------------------------- */
+
+  function ticketHTML(orden) {
+    const { dia, hora } = fechaAviso(new Date(orden.recojoEn));
+    const { domicilio, direccion, costo } = datosEntrega(orden);
+    const pago = datosPago(orden);
+    const filas = orden.items
+      .map((item) => `<tr><td>${esc(detalleItem(item))}</td><td>${money(item.subtotal)}</td></tr>`)
+      .join('');
+
+    return `<h1>${esc(CONFIG.negocio.nombre)}</h1>
+      <p class="tk-sub">${esc(CONFIG.negocio.rubro)}<br>${esc(CONFIG.negocio.direccion)} · ${esc(CONFIG.negocio.telefono)}</p>
+      <div class="tk-sep"></div>
+      <div class="tk-row"><span>Orden</span><span>${esc(orden.codigo)}</span></div>
+      <div class="tk-row"><span>Servicio</span><span>${esc(orden.codigoServicio || orden.clienteCodigo)}</span></div>
+      <div class="tk-row"><span>Cliente</span><span>${esc(orden.clienteCodigo)}</span></div>
+      <div class="tk-row"><span>Fecha</span><span>${fmtFecha.format(new Date(orden.ingreso))} ${fmtHora.format(new Date(orden.ingreso))}</span></div>
+      <div class="tk-sep"></div>
+      <p><strong>${esc(orden.cliente.nombre)}</strong><br>${esc(orden.cliente.telefono)}${orden.cliente.email ? '<br>' + esc(orden.cliente.email) : ''}</p>
+      <div class="tk-sep"></div>
+      <table>${filas}</table>
+      <div class="tk-sep"></div>
+      <div class="tk-row"><span>Subtotal</span><span>${money(orden.subtotal)}</span></div>
+      ${orden.descuento > 0 ? `<div class="tk-row"><span>Descuento</span><span>-${money(orden.descuento)}</span></div>` : ''}
+      ${costo > 0 ? `<div class="tk-row"><span>Envío</span><span>${money(costo)}</span></div>` : ''}
+      <div class="tk-row tk-total"><span>TOTAL</span><span>${money(orden.total)}</span></div>
+      <div class="tk-row"><span>Pago</span><span>${esc(pago.metodo)}</span></div>
+      <div class="tk-row"><span>Pagado</span><span>${money(pago.monto)}</span></div>
+      ${pago.saldo > 0 ? `<div class="tk-row"><span>Saldo</span><span>${money(pago.saldo)}</span></div>` : ''}
+      ${orden.entregadoEn ? `<div class="tk-row"><span>Salida</span><span>${fmtFecha.format(new Date(orden.entregadoEn))} ${fmtHora.format(new Date(orden.entregadoEn))}</span></div>` : ''}
+      ${orden.almacen && orden.estado !== 'entregado' ? `<div class="tk-row"><span>Almacén</span><span>${esc(orden.almacen.codigo)}</span></div>` : ''}
+      ${orden.recibidoPor ? `<div class="tk-row"><span>Recibió</span><span>${esc(orden.recibidoPor.nombre)}${orden.recibidoPor.documento ? ` · ${esc(orden.recibidoPor.documento)}` : ''}</span></div>` : ''}
+      <div class="tk-sep"></div>
+      <div class="tk-aviso"><strong>${domicilio ? 'ENTREGA:' : 'RECOJO:'}</strong> ${esc(capitalizar(dia))}, desde las ${esc(hora)}.<br>${domicilio ? esc(direccion || 'Dirección por confirmar') : 'Presenta tu código ' + esc(orden.codigo)}</div>
+      ${orden.notas ? `<p style="margin-top:6px">Obs: ${esc(orden.notas)}</p>` : ''}
+      <p class="tk-foot">Gracias por su preferencia<br>${esc(CONFIG.negocio.telefono)}</p>`;
+  }
+
+  function imprimirOrden(orden) {
+    // Impresión térmica: 58 o 80 mm según lo elegido en Datos.
+    if (!window.Ticket) {
+      toast('No se pudo cargar el módulo de impresión');
+      return;
+    }
+    Ticket.imprimir(ticketHTML(orden));
+  }
+
+  /* -------------------------------- Modal ------------------------------- */
+
+  function abrirModal(html) {
+    // El modal (z-index 60) queda por encima del panel de precios (55): si el
+    // panel sigue abierto, su botón de cerrar queda tapado por el fondo del
+    // modal. Se cierra antes de abrir.
+  if ($('#panelPrecios').classList.contains('is-open')) cerrarPrecios();
+  if ($('#panelPerfiles').classList.contains('is-open')) cerrarPerfiles();
+  $('#modalContenido').innerHTML = html;
+    $('#modal').classList.add('is-open');
+    $('#modal').setAttribute('aria-hidden', 'false');
+    document.body.classList.add('modal-abierto');
+    const boton = $('#modalContenido .btn-primary') || $('#modalContenido button');
+    if (boton) boton.focus();
+  }
+
+  function cerrarModal() {
+    $('#modal').classList.remove('is-open');
+    $('#modal').setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('modal-abierto');
+    $('#modalContenido').innerHTML = '';
+    liberarComprobanteAnterior();
+    estado.comprobante = null;
+  }
+
+  function abrirModalExito(orden) {
+    const { dia, hora } = fechaAviso(new Date(orden.recojoEn));
+    const entrega = datosEntrega(orden);
+    abrirModal(`
+      <div class="exito-icon" aria-hidden="true">✓</div>
+      <h2>Servicio registrado</h2>
+      <p class="muted">${esc(orden.cliente.nombre)} · código de cliente <strong>${esc(orden.clienteCodigo)}</strong></p>
+      <p class="muted small">Servicio #${String(orden.servicioN || 1).padStart(2, '0')} · ${esc(orden.codigoServicio || '')}</p>
+
+      <div class="code-big">${esc(orden.codigo)}</div>
+
+      <div class="aviso-box">
+        <p class="eyebrow">Aviso para el cliente</p>
+        <strong>${entrega.domicilio ? `Entrega a domicilio el ${esc(dia)}` : `Tus prendas estarán listas el ${esc(dia)}`}</strong>
+        <p>Desde las ${esc(hora)} · ${esc(entrega.domicilio ? entrega.direccion || 'dirección por confirmar' : CONFIG.negocio.direccion)}</p>
+      </div>
+
+      <div class="resumen-mini">
+        <div><span class="k">Prendas</span><span class="v">${orden.prendas} und</span></div>
+        <div><span class="k">Peso registrado</span><span class="v">${Number(orden.pesoTotal).toFixed(2)} kg</span></div>
+        ${entrega.costo > 0 ? `<div><span class="k">Envío</span><span class="v">${money(entrega.costo)}</span></div>` : ''}
+        <div><span class="k">Total a pagar</span><span class="v">${money(orden.total)}</span></div>
+        <div class="total"><span>${entrega.domicilio ? 'Entrega' : 'Recojo'}</span><span>${esc(dia)}, ${esc(hora)}</span></div>
+      </div>
+
+      <div class="modal-acciones">
+        <button class="btn btn-primary" type="button" data-accion="comprobante" data-id="${orden.id}">Enviar comprobante</button>
+        <button class="btn btn-outline" type="button" data-accion="copiar" data-id="${orden.id}">Copiar cuadro del mensaje</button>
+        <button class="btn btn-outline" type="button" data-accion="imprimir" data-id="${orden.id}">Imprimir comprobante</button>
+      </div>
+
+      <details class="preview" style="margin-top:14px">
+        <summary>Ver el mensaje que recibirá el cliente</summary>
+        <pre class="msg-preview">${esc(construirMensaje(orden))}</pre>
+      </details>
+
+      <button class="btn btn-ghost btn-block" type="button" data-accion="cerrar" style="margin-top:8px">Cerrar y continuar</button>
+    `);
+  }
+
+  function abrirDetalle(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+    estado.ordenActual = orden;
+    const { dia, hora } = fechaAviso(new Date(orden.recojoEn));
+    const badge = badgeEstado(orden.estado);
+    const entrega = datosEntrega(orden);
+    const pago = datosPago(orden);
+
+    const pasos = [
+      { titulo: 'Ingreso', fecha: orden.ingreso, nota: orden.operador ? `Registró ${orden.operador}` : '' },
+      { titulo: 'Listo para recoger', fecha: orden.listoEn, nota: '' }
+    ];
+    if (orden.almacen) {
+      pasos.push({ titulo: `En almacén · ${orden.almacen.codigo}`, fecha: orden.almacen.desde, nota: orden.almacen.nota || '' });
+    }
+    pasos.push({
+      titulo: entrega.domicilio ? 'Entrega a domicilio' : 'Recogido',
+      fecha: orden.entregadoEn,
+      nota: orden.recibidoPor ? `Recibió ${orden.recibidoPor.nombre}` : ''
+    });
+
+    abrirModal(`
+      <p class="eyebrow">Orden de servicio</p>
+      <h2>${esc(orden.codigo)}</h2>
+      <p class="muted">${esc(orden.cliente.nombre)} · ${esc(orden.clienteCodigo)}</p>
+
+      <dl class="orden-meta">
+        <div><dt>Teléfono</dt><dd>${esc(orden.cliente.telefono)}</dd></div>
+        <div><dt>Correo</dt><dd>${esc(orden.cliente.email || '—')}</dd></div>
+        <div><dt>Ingreso</dt><dd>${fmtFecha.format(new Date(orden.ingreso))} · ${fmtHora.format(new Date(orden.ingreso))}</dd></div>
+        <div><dt>Servicio</dt><dd>#${String(orden.servicioN || 1).padStart(2, '0')} · ${esc(orden.codigoServicio || orden.clienteCodigo)}</dd></div>
+        <div><dt>Recojo</dt><dd>${esc(capitalizar(dia))} · ${esc(hora)}</dd></div>
+        <div><dt>Entrega</dt><dd>${entrega.domicilio ? `Domicilio · ${esc(entrega.direccion || 'sin dirección')}` : 'Recojo en tienda'}</dd></div>
+        ${orden.almacen ? `<div><dt>Almacén</dt><dd><strong>${esc(orden.almacen.codigo)}</strong>${orden.almacen.nota ? ` · ${esc(orden.almacen.nota)}` : ''}</dd></div>` : ''}
+        <div><dt>Proceso</dt><dd>${esc(orden.procesoNombre || '—')}</dd></div>
+        <div><dt>Pago</dt><dd>${esc(pago.metodo)} · ${esc(etiquetaPago(pago.estado).nombre)}</dd></div>
+        <div><dt>Pagado</dt><dd>${money(pago.monto)}</dd></div>
+        <div><dt>Saldo</dt><dd>${pago.saldo > 0 ? `<strong>${money(pago.saldo)}</strong>` : '—'}</dd></div>
+        <div><dt>Estado</dt><dd>${badge}</dd></div>
+        <div><dt>Listo</dt><dd>${orden.listoEn ? `${fmtFecha.format(new Date(orden.listoEn))} · ${fmtHora.format(new Date(orden.listoEn))}` : '—'}</dd></div>
+        <div><dt>Salida</dt><dd>${orden.entregadoEn ? `${fmtFecha.format(new Date(orden.entregadoEn))} · ${fmtHora.format(new Date(orden.entregadoEn))}` : '—'}</dd></div>
+        ${orden.recibidoPor ? `<div><dt>Recogió</dt><dd>${esc(orden.recibidoPor.nombre)}${orden.recibidoPor.documento ? ` · ${esc(orden.recibidoPor.documento)}` : ''}</dd></div>` : ''}
+        <div><dt>Registró</dt><dd>${esc(orden.operador || '—')}</dd></div>
+      </dl>
+
+      <ol class="timeline">
+        ${pasos
+          .map(
+            (paso) => `<li class="${paso.fecha ? 'done' : ''}">
+              <span class="dot"></span>
+              <div>
+                <strong>${esc(paso.titulo)}</strong>
+                <small>${paso.fecha ? `${fmtFecha.format(new Date(paso.fecha))} · ${fmtHora.format(new Date(paso.fecha))}${paso.nota ? ` · ${esc(paso.nota)}` : ''}` : 'Pendiente'}</small>
+              </div>
+            </li>`
+          )
+          .join('')}
+      </ol>
+
+      <ul class="detalle-lista">
+        ${orden.items
+          .map(
+            (item) =>
+              `<li><span>${esc(item.nombre)} · ${item.tipo === 'peso' ? Number(item.cantidad).toFixed(2) + ' kg' : item.cantidad + ' ' + item.unidad}</span><span>${money(item.subtotal)}</span></li>`
+          )
+          .join('')}
+      </ul>
+
+      <div class="resumen-mini">
+        <div><span class="k">Subtotal</span><span class="v">${money(orden.subtotal)}</span></div>
+        ${orden.descuento > 0 ? `<div><span class="k">Descuento</span><span class="v">-${money(orden.descuento)}</span></div>` : ''}
+        ${entrega.costo > 0 ? `<div><span class="k">Envío</span><span class="v">${money(entrega.costo)}</span></div>` : ''}
+        <div class="total"><span>Total</span><span>${money(orden.total)}</span></div>
+        <div><span class="k">Pagado</span><span class="v">${money(pago.monto)}</span></div>
+        ${pago.saldo > 0 ? `<div><span class="k">Saldo por cobrar</span><span class="v"><strong>${money(pago.saldo)}</strong></span></div>` : ''}
+      </div>
+
+      ${orden.notas ? `<p class="hint" style="margin-bottom:12px">Observaciones: ${esc(orden.notas)}</p>` : ''}
+
+      <div class="acciones-fila">
+        ${pago.saldo > 0 ? `<button class="btn btn-primary btn-sm" type="button" data-cobrar="${orden.id}">Cobrar saldo · ${money(pago.saldo)}</button>` : ''}
+        ${orden.estado === 'recibido' ? `<button class="btn btn-primary btn-sm" type="button" data-listo="${orden.id}">Marcar listo y avisar</button>` : ''}
+        ${orden.estado !== 'entregado' ? `<button class="btn ${orden.estado === 'listo' || orden.estado === 'almacen' ? 'btn-primary' : 'btn-outline'} btn-sm" type="button" data-salida="${orden.id}">Prendas recogidas</button>` : ''}
+        ${orden.estado !== 'entregado' ? `<button class="btn btn-outline btn-sm" type="button" data-almacen="${orden.id}">${orden.almacen ? 'Cambiar ubicación' : 'Guardar en almacén'}</button>` : ''}
+        ${orden.estado !== 'recibido' ? `<button class="btn btn-ghost btn-sm" type="button" data-estado="recibido" data-id="${orden.id}">Volver a proceso</button>` : ''}
+      </div>
+
+      <div class="modal-acciones" style="margin-top:10px">
+        <button class="btn btn-outline" type="button" data-accion="comprobante" data-id="${orden.id}">${orden.estado === 'listo' ? 'Reenviar comprobante' : 'Enviar comprobante'}</button>
+        <button class="btn btn-outline" type="button" data-accion="imprimir" data-id="${orden.id}">Imprimir comprobante</button>
+      </div>
+    `);
+  }
+
+  /* ------------------------------- Cobros ------------------------------- */
+
+  function abrirCobro(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+    const pago = datosPago(orden);
+
+    if (pago.saldo <= 0) {
+      toast('Este servicio ya está pagado');
+      return;
+    }
+
+    abrirModal(`
+      <p class="eyebrow">Cobro</p>
+      <h2>Registrar pago · ${esc(orden.codigo)}</h2>
+      <p class="muted">${esc(orden.cliente.nombre)} · saldo pendiente ${money(pago.saldo)}</p>
+
+      <div class="grid-2" style="margin-top:16px">
+        <div class="field">
+          <label for="cobroMetodo">Tipo de pago</label>
+          <select id="cobroMetodo">${CONFIG.pagos.map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}</select>
+        </div>
+        <div class="field">
+          <label for="cobroMonto">Monto a cobrar (S/)</label>
+          <input id="cobroMonto" type="number" min="0" step="0.10" value="${pago.saldo.toFixed(2)}" inputmode="decimal" />
+        </div>
+      </div>
+
+      <p class="form-error" id="cobroError" role="alert"></p>
+
+      <div class="modal-acciones">
+        <button class="btn btn-primary" type="button" data-confirmar-cobro="${orden.id}">Confirmar cobro</button>
+        <button class="btn btn-ghost" type="button" data-accion="cerrar">Cancelar</button>
+      </div>
+    `);
+
+    const campo = $('#cobroMonto');
+    if (campo) {
+      campo.focus();
+      campo.select();
+    }
+  }
+
+  function confirmarCobro(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+    const pago = datosPago(orden);
+    const monto = redondear(Math.min(Math.max(parseNum($('#cobroMonto').value), 0), pago.saldo));
+
+    if (monto <= 0) {
+      $('#cobroError').textContent = 'Escribe un monto mayor a cero.';
+      return;
+    }
+
+    const metodo = $('#cobroMetodo').value || CONFIG.pagos[0];
+    const montoTotal = redondear(pago.monto + monto);
+    const saldo = redondear(Number(orden.total) - montoTotal);
+    const movimientos = pago.movimientos.concat([{
+      fecha: new Date().toISOString(),
+      monto,
+      metodo,
+      tipo: saldo <= 0 ? 'saldo' : 'abono',
+      operador: estado.operador ? estado.operador.nombre : 'Operador'
+    }]);
+
+    Store.updateOrden(id, {
+      formaPago: metodo,
+      pago: { estado: saldo <= 0 ? 'pagado' : 'adelanto', metodo, monto: montoTotal, saldo, movimientos }
+    });
+
+    cerrarModal();
+    renderOrdenes();
+    renderResumen();
+    renderClientes();
+    toast(saldo <= 0 ? 'Pago completo registrado' : `Abono registrado · saldo ${money(saldo)}`);
+    abrirDetalle(id);
+  }
+
+  function abrirDatos() {
+    // Datos (respaldo, importación, borrado) es solo de administración.
+    if (!esAdmin()) {
+      toast('Solo el administrador accede a Datos');
+      return;
+    }
+    const ordenes = Store.getOrdenes().length;
+    const clientes = Store.getClientes().length;
+    abrirModal(`
+      <p class="eyebrow">Respaldo</p>
+      <h2>Datos del sistema</h2>
+      <p class="muted">${ordenes} órdenes y ${clientes} clientes guardados en este navegador.</p>
+
+      <div class="modal-acciones" style="margin-top:18px">
+        <button class="btn btn-outline" type="button" data-accion="respaldo">Descargar respaldo (JSON)</button>
+        <button class="btn btn-outline" type="button" data-accion="csv">Exportar órdenes (CSV)</button>
+        <button class="btn btn-outline" type="button" data-accion="importar">Restaurar desde respaldo</button>
+      </div>
+
+      <input type="file" id="archivoRespaldo" accept="application/json,.json" hidden />
+
+      <div class="datos-impresion">
+        <p class="eyebrow">Impresión de tickets</p>
+        <p class="muted small">Elige el ancho del papel de la impresora térmica.</p>
+        <div class="chips" id="anchoTicket" role="group" aria-label="Ancho del ticket">
+          ${[58, 80]
+            .map(
+              (mm) =>
+                `<button class="chip${Ticket.leerPreferencia().ancho === mm ? ' is-active' : ''}" type="button" data-ancho="${mm}">${mm} mm</button>`
+            )
+            .join('')}
+        </div>
+        <button class="btn btn-outline btn-sm" type="button" data-accion="prueba-ticket" style="margin-top:10px">Imprimir ticket de prueba</button>
+        <p class="hint">El ticket sale con el ancho elegido. Si el texto se corta, cambia al otro tamaño.</p>
+      </div>
+
+      <p class="hint" style="margin-top:14px">Los datos viven en este navegador (localStorage). Descarga un respaldo antes de cambiar de equipo o limpiar el navegador.</p>
+      <button class="btn btn-ghost btn-block" type="button" data-accion="cerrar" style="margin-top:10px">Cerrar</button>
+    `);
+  }
+
+  /* ------------------------------ Descargas ----------------------------- */
+
+  function descargar(nombre, contenido, tipo) {
+    const blob = new Blob([contenido], { type: tipo });
+    const url = URL.createObjectURL(blob);
+    const enlace = document.createElement('a');
+    enlace.href = url;
+    enlace.download = nombre;
+    document.body.appendChild(enlace);
+    enlace.click();
+    document.body.removeChild(enlace);
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+
+  function exportarRespaldo() {
+    descargar(`lavamili-respaldo-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(Store.snapshot(), null, 2), 'application/json');
+    toast('Respaldo descargado');
+  }
+
+  function exportarCSV() {
+    const filas = [['Codigo', 'Servicio', 'Cliente', 'Codigo cliente', 'Telefono', 'Ingreso', 'Recojo', 'Salida', 'Entrega', 'Almacen', 'Peso kg', 'Prendas', 'Total', 'Estado', 'Pago', 'Estado pago', 'Pagado', 'Saldo', 'Recogido por']];
+    Store.getOrdenes().forEach((o) => {
+      filas.push([
+        o.codigo,
+        o.codigoServicio || '',
+        o.cliente.nombre,
+        o.clienteCodigo,
+        o.cliente.telefono,
+        fmtFecha.format(new Date(o.ingreso)),
+        fmtFecha.format(new Date(o.recojoEn)),
+        o.entregadoEn ? fmtFecha.format(new Date(o.entregadoEn)) : '',
+        o.entrega && o.entrega.tipo === 'domicilio' ? `Domicilio: ${o.entrega.direccion || ''}` : 'Tienda',
+        o.almacen ? o.almacen.codigo : '',
+        Number(o.pesoTotal).toFixed(2),
+        o.prendas,
+        Number(o.total).toFixed(2),
+        o.estado,
+        datosPago(o).metodo,
+        etiquetaPago(datosPago(o).estado).nombre,
+        datosPago(o).monto.toFixed(2),
+        datosPago(o).saldo.toFixed(2),
+        o.recibidoPor ? o.recibidoPor.nombre : ''
+      ]);
+    });
+    const csv = filas.map((f) => f.map((c) => `"${String(c ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
+    descargar(`lavamili-ordenes-${new Date().toISOString().slice(0, 10)}.csv`, '\uFEFF' + csv, 'text/csv;charset=utf-8;');
+    toast('Órdenes exportadas');
+  }
+
+  function importarRespaldo(archivo) {
+    const lector = new FileReader();
+    lector.onload = () => {
+      try {
+        const datos = JSON.parse(String(lector.result));
+        if (!datos || !Array.isArray(datos.ordenes)) throw new Error('Formato no válido');
+        Store.reemplazarTodo(datos);
+        renderCatalogo();
+        renderOrdenes();
+        renderClientes();
+        renderResumen();
+        renderBanner();
+        refrescarResumen();
+        cerrarModal();
+        toast(`Respaldo restaurado: ${datos.ordenes.length} órdenes`);
+      } catch (error) {
+        toast('El archivo no es un respaldo válido de Lavandería Mili');
+      }
+    };
+    lector.readAsText(archivo);
+  }
+
+  /* ------------------------------ Estados ------------------------------- */
+
+  function badgeEstado(idEstado) {
+    const def = CONFIG.estados.find((e) => e.id === idEstado) || CONFIG.estados[0];
+    return `<span class="estado ${def.clase}">${esc(def.nombre)}</span>`;
+  }
+
+  function proximoRecordatorio(base) {
+    return calcularListo(base, 24);
+  }
+
+  const ESTADOS_PENDIENTES = ['listo', 'almacen'];
+
+  function pendientesDeRecojo() {
+    return Store.getOrdenes()
+      .filter((o) => ESTADOS_PENDIENTES.includes(o.estado))
+      .sort((a, b) => new Date(a.recojoEn) - new Date(b.recojoEn));
+  }
+
+  function recordatoriosPendientes() {
+    const ahora = Date.now();
+    return pendientesDeRecojo().filter((o) => o.recordatorioEn && new Date(o.recordatorioEn).getTime() <= ahora);
+  }
+
+  function renderBanner() {
+    const banner = $('#bannerAvisos');
+    const pendientes = pendientesDeRecojo();
+
+    if (banner) {
+      if (!pendientes.length) {
+        banner.classList.add('oculto');
+      } else {
+        const enAlmacen = pendientes.filter((o) => o.estado === 'almacen').length;
+        const porReenviar = recordatoriosPendientes().length;
+        const partes = [];
+
+        if (enAlmacen) partes.push(`${enAlmacen} en almacén`);
+        partes.push(porReenviar ? `${porReenviar} con recordatorio pendiente` : 'recordatorio programado para el día siguiente');
+
+        $('#bannerTitulo').textContent = `${pendientes.length} ${pendientes.length === 1 ? 'servicio pendiente' : 'servicios pendientes'} de recojo`;
+        $('#bannerDetalle').textContent = partes.join(' · ');
+        banner.classList.remove('oculto');
+      }
+    }
+
+    // El tablero se refresca junto con los avisos: todo cambio de estado
+    // termina llamando a esta función.
+    renderTablero();
+  }
+
+  function marcarListo(id, enviar = true, abrirFicha = true) {
+    const orden = Store.getOrden(id);
+    if (!orden || orden.estado === 'entregado') return;
+
+    const ahora = new Date();
+    const actualizada = Store.updateOrden(id, {
+      estado: 'listo',
+      listoEn: orden.listoEn || ahora.toISOString(),
+      recordatorioEn: proximoRecordatorio(ahora).toISOString(),
+      ultimoAvisoEn: enviar ? ahora.toISOString() : orden.ultimoAvisoEn || null
+    });
+
+    renderOrdenes();
+    renderResumen();
+    renderBanner();
+    renderClientes();
+    if (abrirFicha) abrirDetalle(id);
+    toast('Servicio listo. Aviso al cliente preparado.');
+    if (enviar) enviarComprobante(actualizada, 'listo');
+  }
+
+  function confirmarSalida(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+    const entrega = datosEntrega(orden);
+    const verbo = entrega.domicilio ? 'recibe' : 'recoge';
+
+    abrirModal(`
+      <p class="eyebrow">Entrega de prendas</p>
+      <h2>Registrar salida</h2>
+      <p class="muted">${esc(orden.cliente.nombre)} · ${esc(orden.clienteCodigo)}</p>
+
+      <div class="codigo-entrega">
+        <span>Código del servicio</span>
+        <strong>${esc(orden.codigo)}</strong>
+        <small>${esc(orden.codigoServicio || '')} · Servicio #${String(orden.servicioN || 1).padStart(2, '0')}</small>
+      </div>
+
+      <div class="resumen-mini">
+        <div><span class="k">Prendas</span><span class="v">${orden.prendas} und</span></div>
+        <div><span class="k">Peso</span><span class="v">${Number(orden.pesoTotal).toFixed(2)} kg</span></div>
+        <div><span class="k">Entrega</span><span class="v">${entrega.domicilio ? 'A domicilio' : 'En tienda'}</span></div>
+        ${orden.almacen ? `<div><span class="k">Almacén</span><span class="v">${esc(orden.almacen.codigo)}</span></div>` : ''}
+        <div class="total"><span>Total cobrado</span><span>${money(orden.total)}</span></div>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="quienRecoge">Quién ${verbo} <span class="req">*</span></label>
+          <input id="quienRecoge" type="text" value="${esc(orden.cliente.nombre)}" autocomplete="off" />
+          <p class="hint">Por defecto el titular; cámbialo si viene otra persona.</p>
+        </div>
+        <div class="field">
+          <label for="documentoRecoge">DNI / documento</label>
+          <input id="documentoRecoge" type="text" inputmode="numeric" maxlength="12" placeholder="Opcional" autocomplete="off" />
+        </div>
+      </div>
+
+      <div class="verifica">
+        <label for="codigoVerifica">Últimos 4 o 5 números del código <span class="req">*</span></label>
+        <div class="verifica-fila">
+          <input id="codigoVerifica" type="text" inputmode="numeric" maxlength="14" data-orden="${orden.id}" placeholder="Ej. ${esc(String(orden.codigo || '').split('-').pop().slice(-4))}" autocomplete="off" spellcheck="false" />
+          <button class="btn btn-outline" type="button" id="btnVerificar" data-verificar="${orden.id}">Verificar</button>
+        </div>
+        <p class="hint" id="verificaMsg">Últimos 4 o 5 números del comprobante; también vale el código completo.</p>
+      </div>
+
+      <p class="hint">Se guarda quién recibe, la fecha y la hora. El servicio queda cerrado y dejan de enviarse recordatorios.</p>
+
+      <div class="modal-acciones" style="margin-top:14px">
+        <button class="btn btn-primary" type="button" id="btnConfirmarEntrega" data-confirmar-salida="${orden.id}" disabled>Confirmar entrega</button>
+        <button class="btn btn-ghost" type="button" data-accion="cerrar">Cancelar</button>
+      </div>
+    `);
+  }
+
+  const normalizarCodigo = (valor) => String(valor || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+  function verificarCodigo(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+
+    const campo = $('#codigoVerifica');
+    const mensaje = $('#verificaMsg');
+    const boton = $('#btnConfirmarEntrega');
+    const valor = normalizarCodigo(campo.value);
+
+    if (!valor) {
+      campo.focus();
+      mensaje.textContent = 'Escribe los últimos 4 o 5 números del código.';
+      mensaje.className = 'hint error';
+      toast('Escribe los últimos números del código');
+      return;
+    }
+
+    const digitos = String(orden.codigo || '').replace(/\D/g, '');
+    // Serial del servicio (lo que va después del último guion): 0001, 0012…
+    const partes = String(orden.codigo || '').split('-');
+    const serial = partes[partes.length - 1];
+    const corto4 = serial.slice(-4);
+    const corto5 = serial.padStart(5, '0').slice(-5);
+    const completo = normalizarCodigo(orden.codigo);
+    const coincide = valor.length >= 4 && (valor === corto4 || valor === corto5 || valor === completo || valor === digitos);
+
+    if (!coincide) {
+      campo.classList.add('invalid');
+      mensaje.textContent = `No coincide: no es la terminación de ${orden.codigo}. Revisa el comprobante del cliente.`;
+      mensaje.className = 'hint error';
+      boton.disabled = true;
+      toast('Código incorrecto');
+      campo.focus();
+      campo.select();
+      return;
+    }
+
+    campo.classList.remove('invalid');
+    campo.readOnly = true;
+    $('#btnVerificar').disabled = true;
+    mensaje.textContent = `Código verificado (${orden.codigo}). Ya puedes confirmar la entrega.`;
+    mensaje.className = 'hint ok';
+    boton.disabled = false;
+    boton.focus();
+    toast('Código verificado');
+  }
+
+  function ejecutarEntrega(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+
+    const nombre = $('#quienRecoge').value.trim();
+    const documento = $('#documentoRecoge').value.trim();
+
+    if (nombre.length < 3) {
+      marcarInvalido('#quienRecoge');
+      toast('Escribe el nombre de quien recoge las prendas');
+      return;
+    }
+    if ($('#btnConfirmarEntrega').disabled) {
+      toast('Verifica el código del servicio antes de entregar');
+      return;
+    }
+
+    const ahora = new Date().toISOString();
+    Store.updateOrden(id, {
+      estado: 'entregado',
+      entregadoEn: ahora,
+      recordatorioEn: null,
+      recibidoPor: { nombre, documento, fecha: ahora }
+    });
+
+    renderOrdenes();
+    renderResumen();
+    renderBanner();
+    renderClientes();
+    cerrarModal();
+    toast(`${orden.codigo} entregado a ${nombre}`);
+  }
+
+  function abrirModalAvisos() {
+    const pendientes = pendientesDeRecojo();
+
+    abrirModal(`
+      <p class="eyebrow">Seguimiento</p>
+      <h2>Avisos de recojo</h2>
+      <p class="muted">Servicios listos o en almacén que aún no se entregan. El recordatorio se reenvía cada 24 horas hasta el cierre.</p>
+
+      <div class="avisos-lista">
+        ${
+          pendientes
+            .map((o) => {
+              const rec = o.recordatorioEn ? new Date(o.recordatorioEn) : null;
+              const pendiente = rec && rec.getTime() <= Date.now();
+              return `<div class="aviso-item">
+                <div class="aviso-info">
+                  <strong>${esc(o.cliente.nombre)}</strong>
+                  <span>${esc(o.codigo)} · ${esc(o.codigoServicio || '')} · ${money(o.total)}${o.entrega && o.entrega.tipo === 'domicilio' ? ' · envío' : ''}</span>
+                  ${o.almacen ? `<span>Almacén <strong>${esc(o.almacen.codigo)}</strong>${o.almacen.nota ? ` · ${esc(o.almacen.nota)}` : ''}</span>` : ''}
+                  <span class="${pendiente ? 'aviso-pend' : ''}">${rec ? (pendiente ? 'Recordatorio pendiente: ' : 'Próximo recordatorio: ') + esc(fechaAviso(rec).corta) : 'Sin recordatorio programado'}</span>
+                </div>
+                <div class="aviso-acciones">
+                  <button class="btn btn-sm btn-primary" type="button" data-accion="comprobante" data-id="${o.id}">Reenviar</button>
+                  <button class="btn btn-sm btn-outline" type="button" data-almacen="${o.id}">Almacén</button>
+                  <button class="btn btn-sm btn-outline" type="button" data-salida="${o.id}">Recogido</button>
+                </div>
+              </div>`;
+            })
+            .join('') || '<p class="sin-datos">No hay servicios pendientes de recojo.</p>'
+        }
+      </div>
+
+      <button class="btn btn-ghost btn-block" type="button" data-accion="cerrar">Cerrar</button>
+    `);
+  }
+
+  function registrarReenvio(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+    Store.updateOrden(id, {
+      ultimoAvisoEn: new Date().toISOString(),
+      recordatorioEn: proximoRecordatorio(new Date()).toISOString()
+    });
+    renderBanner();
+    renderOrdenes();
+    if ($('#modalContenido .avisos-lista')) abrirModalAvisos();
+    toast('Recordatorio reenviado. El siguiente queda para mañana.');
+  }
+
+  function abrirAlmacen(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+    const actual = orden.almacen || {};
+
+    abrirModal(`
+      <p class="eyebrow">Resguardo</p>
+      <h2>${orden.almacen ? 'Cambiar ubicación' : 'Guardar en almacén'}</h2>
+      <p class="muted">${esc(orden.cliente.nombre)} · ${esc(orden.codigo)} · Servicio #${String(orden.servicioN || 1).padStart(2, '0')}</p>
+
+      <div class="field mt-14">
+        <label for="codigoAlmacen">Código de almacén <span class="req">*</span></label>
+        <input id="codigoAlmacen" type="text" list="listaAlmacenes" value="${esc(actual.codigo || '')}" placeholder="Ej. ALM-A2" autocomplete="off" />
+        <datalist id="listaAlmacenes">
+          ${CONFIG.almacenes.map((a) => `<option value="${esc(a.codigo)}">${esc(a.nombre)}</option>`).join('')}
+        </datalist>
+        <p class="hint">Elige una ubicación de la lista o escribe un código propio.</p>
+      </div>
+
+      <div class="field">
+        <label for="notaAlmacen">Referencia (opcional)</label>
+        <input id="notaAlmacen" type="text" value="${esc(actual.nota || '')}" placeholder="Ej. caja 3, bolsa con nombre" />
+      </div>
+
+      <p class="hint" style="margin-top:10px">El servicio queda como «En almacén» y sigue enviando recordatorios hasta que se recoja.</p>
+
+      <div class="modal-acciones" style="margin-top:14px">
+        <button class="btn btn-primary" type="button" data-guardar-almacen="${orden.id}">Guardar ubicación</button>
+        ${orden.almacen ? `<button class="btn btn-outline" type="button" data-quitar-almacen="${orden.id}">Quitar de almacén</button>` : ''}
+        <button class="btn btn-ghost" type="button" data-accion="cerrar">Cancelar</button>
+      </div>
+    `);
+  }
+
+  function guardarAlmacen(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+    const codigo = $('#codigoAlmacen').value.trim().toUpperCase();
+    const nota = $('#notaAlmacen').value.trim();
+
+    if (codigo.length < 3) {
+      marcarInvalido('#codigoAlmacen');
+      toast('Escribe el código de almacén (ej. ALM-A2)');
+      return;
+    }
+
+    Store.updateOrden(id, {
+      estado: 'almacen',
+      almacen: {
+        codigo,
+        nota,
+        desde: orden.almacen && orden.almacen.desde ? orden.almacen.desde : new Date().toISOString()
+      }
+    });
+
+    renderOrdenes();
+    renderResumen();
+    renderBanner();
+    abrirDetalle(id);
+    toast(`Guardado en ${codigo}`);
+  }
+
+  function quitarAlmacen(id) {
+    const orden = Store.getOrden(id);
+    if (!orden) return;
+    Store.updateOrden(id, { estado: 'listo', almacen: null });
+    renderOrdenes();
+    renderResumen();
+    renderBanner();
+    abrirDetalle(id);
+    toast('Prenda retirada del almacén');
+  }
+
+  function cambiarEstado(id, nuevoEstado) {
+    const cambios = { estado: nuevoEstado };
+
+    if (nuevoEstado === 'recibido') {
+      cambios.listoEn = null;
+      cambios.entregadoEn = null;
+      cambios.recordatorioEn = null;
+      cambios.almacen = null;
+    } else if (nuevoEstado === 'listo') {
+      cambios.listoEn = new Date().toISOString();
+      cambios.entregadoEn = null;
+      cambios.recordatorioEn = proximoRecordatorio(new Date()).toISOString();
+    } else if (nuevoEstado === 'entregado') {
+      cambios.entregadoEn = new Date().toISOString();
+      cambios.recordatorioEn = null;
+    }
+
+    const orden = Store.updateOrden(id, cambios);
+    if (!orden) return;
+    renderOrdenes();
+    renderResumen();
+    renderBanner();
+    renderClientes();
+    toast(`Orden ${orden.codigo}: ${CONFIG.estados.find((e) => e.id === nuevoEstado).nombre}`);
+    abrirDetalle(id);
+  }
+
+  /* -------------------------------- Órdenes ----------------------------- */
+
+  function ordenesFiltradas() {
+    const texto = $('#buscarOrden').value.trim().toLowerCase();
+    const filtro = $('#filtroEstado').value;
+    return Store.getOrdenes()
+      .slice()
+      .sort((a, b) => (a.ingreso < b.ingreso ? 1 : -1))
+      .filter((o) => {
+        if (filtro && o.estado !== filtro) return false;
+        if (!texto) return true;
+        return [o.codigo, o.codigoServicio, o.cliente.nombre, o.cliente.telefono, o.clienteCodigo, o.almacen && o.almacen.codigo]
+          .join(' ')
+          .toLowerCase()
+          .includes(texto);
+      });
+  }
+
+  function renderOrdenes() {
+    const lista = ordenesFiltradas();
+    const cuerpo = $('#tablaOrdenes');
+    const vacio = $('#ordenesVacio');
+    const hayDatos = Store.getOrdenes().length > 0;
+
+    if (!lista.length) {
+      cuerpo.innerHTML = '';
+      vacio.classList.remove('oculto');
+      const titulo = vacio.querySelector('strong');
+      const texto = vacio.querySelector('p');
+      if (hayDatos) {
+        titulo.textContent = 'Sin resultados';
+        texto.textContent = 'Prueba con otro código, nombre o estado.';
+      }
+      return;
+    }
+    vacio.classList.add('oculto');
+
+    cuerpo.innerHTML = lista
+      .map((o) => {
+        const recojo = new Date(o.recojoEn);
+        const entrega = datosEntrega(o);
+        const pagoBadge = badgePago(o);
+        const detalle = [o.pesoTotal > 0 ? `${Number(o.pesoTotal).toFixed(2)} kg` : null, `${o.prendas} und`].filter(Boolean).join(' · ');
+        return `<tr>
+          <td class="code-cell">${esc(o.codigo)}<br><span class="muted small">Servicio #${String(o.servicioN || 1).padStart(2, '0')}</span></td>
+          <td><div class="who"><strong>${esc(o.cliente.nombre)}</strong><span>${esc(o.clienteCodigo)} · ${esc(o.cliente.telefono)}</span></div></td>
+          <td>${fmtFecha.format(new Date(o.ingreso))}<br><span class="muted small">${fmtHora.format(new Date(o.ingreso))}</span></td>
+          <td>${fmtFecha.format(recojo)}<br><span class="muted small">${fmtHora.format(recojo)}</span>${entrega.domicilio ? '<br><span class="tag-domicilio">Domicilio</span>' : ''}</td>
+          <td class="detalle-celda">${esc(detalle)}</td>
+          <td class="right code-cell">${money(o.total)}${pagoBadge ? `<br>${pagoBadge}` : ''}</td>
+          <td>${badgeEstado(o.estado)}${o.entregadoEn ? `<br><span class="muted small">Salida ${fmtHora.format(new Date(o.entregadoEn))}</span>` : ''}${o.recibidoPor ? `<br><span class="muted small">Recogió: ${esc(o.recibidoPor.nombre)}</span>` : ''}${o.almacen && o.estado !== 'entregado' ? `<br><span class="tag-almacen">${esc(o.almacen.codigo)}</span>` : ''}</td>
+          <td class="right">
+            <div class="row-actions">
+              <button class="btn-mini" type="button" data-ver="${o.id}">Ver</button>
+              ${datosPago(o).saldo > 0 ? `<button class="btn-mini" type="button" data-cobrar="${o.id}">Cobrar</button>` : ''}
+              <button class="btn-mini wa" type="button" data-wa="${o.id}">WhatsApp</button>
+              ${o.estado === 'recibido' ? `<button class="btn-mini" type="button" data-listo="${o.id}">Listo</button>` : ''}
+              ${o.estado === 'listo' ? `<button class="btn-mini" type="button" data-almacen="${o.id}">Almacén</button>` : ''}
+              ${o.estado !== 'entregado' ? `<button class="btn-mini" type="button" data-salida="${o.id}">Recogido</button>` : ''}
+              <button class="btn-mini" type="button" data-print="${o.id}">Imprimir</button>
+            </div>
+          </td>
+        </tr>`;
+      })
+      .join('');
+  }
+
+  /* -------------------------------- Clientes ---------------------------- */
+
+  function renderClientes() {
+    const texto = $('#buscarCliente').value.trim().toLowerCase();
+    const clientes = Store.getClientes()
+      .map((c) => ({ ...c, stats: Store.statsCliente(c) }))
+      .filter((c) => !texto || `${c.codigo} ${c.nombre} ${c.telefono}`.toLowerCase().includes(texto))
+      .sort((a, b) => (b.stats.ultima || '').localeCompare(a.stats.ultima || ''));
+
+    const cuerpo = $('#tablaClientes');
+    const vacio = $('#clientesVacio');
+
+    if (!clientes.length) {
+      cuerpo.innerHTML = '';
+      vacio.classList.remove('oculto');
+      return;
+    }
+    vacio.classList.add('oculto');
+
+    cuerpo.innerHTML = clientes
+      .map(
+        (c) => `<tr>
+          <td class="code-cell">${esc(c.codigo)}</td>
+          <td><strong>${esc(c.nombre)}</strong></td>
+          <td>${esc(c.telefono)}</td>
+          <td class="detalle-celda">${esc(c.email || '—')}</td>
+          <td class="right">${c.stats.ordenes}</td>
+          <td class="right code-cell">${money(c.stats.total)}</td>
+          <td>${c.stats.ultima ? fmtFecha.format(new Date(c.stats.ultima)) : '—'}</td>
+          <td class="right">${esAdmin() ? `<button class="btn-mini" type="button" data-editar-cliente="${esc(c.id)}">Editar</button>` : ''}</td>
+        </tr>`
+      )
+      .join('');
+  }
+
+  /** Ficha del cliente: solo administración puede cambiar los datos. */
+  function modalCliente(id) {
+    if (!esAdmin()) {
+      toast('Solo el administrador edita clientes');
+      return;
+    }
+    const cliente = Store.getClientes().find((c) => c.id === id);
+    if (!cliente) return;
+    const stats = Store.statsCliente(cliente);
+
+    abrirModal(`
+      <h2>${esc(cliente.nombre)}</h2>
+      <p class="muted small">${esc(cliente.codigo)} · ${stats.ordenes} ${stats.ordenes === 1 ? 'orden' : 'órdenes'} · ${money(stats.total)} de consumo</p>
+      <form id="formCliente" class="form-codigo" autocomplete="off">
+        <label class="field">
+          <span>Nombre y apellidos</span>
+          <input id="cliEditNombre" type="text" value="${esc(cliente.nombre)}" required />
+        </label>
+        <label class="field">
+          <span>Teléfono / WhatsApp</span>
+          <input id="cliEditTelefono" type="tel" value="${esc(cliente.telefono)}" required />
+        </label>
+        <label class="field">
+          <span>Correo electrónico</span>
+          <input id="cliEditEmail" type="email" value="${esc(cliente.email || '')}" />
+        </label>
+        <p class="form-error" id="cliEditError" role="alert"></p>
+        <div class="modal-acciones">
+          <button class="btn btn-primary" type="submit">Guardar cambios</button>
+          <button class="btn btn-outline" type="button" data-accion="cerrar">Cancelar</button>
+        </div>
+      </form>
+    `);
+
+    $('#formCliente').addEventListener('submit', (evento) => {
+      evento.preventDefault();
+      const nombre = $('#cliEditNombre').value.trim();
+      const telefono = $('#cliEditTelefono').value.trim();
+      const email = $('#cliEditEmail').value.trim();
+      const error = $('#cliEditError');
+
+      if (nombre.length < 3) {
+        error.textContent = 'Escribe el nombre completo.';
+        return;
+      }
+      if (telefono.replace(/\D/g, '').length < 6) {
+        error.textContent = 'El teléfono no parece válido.';
+        return;
+      }
+      const otro = Store.buscarPorTelefono(telefono);
+      if (otro && otro.id !== id) {
+        error.textContent = 'Ese teléfono ya pertenece a otro cliente.';
+        return;
+      }
+
+      Store.actualizarCliente(id, { nombre, telefono, email });
+      cerrarModal();
+      renderClientes();
+      toast('Ficha del cliente actualizada');
+    });
+  }
+
+  /* -------------------------------- Tablero ----------------------------- */
+
+  function haceTiempo(fechaISO) {
+    if (!fechaISO) return '';
+    const minutos = Math.max(0, Math.round((Date.now() - new Date(fechaISO).getTime()) / 60000));
+    if (minutos < 1) return 'ahora';
+    if (minutos < 60) return `hace ${minutos} min`;
+    const horas = Math.floor(minutos / 60);
+    if (horas < 24) return `hace ${horas} h`;
+    return `hace ${Math.floor(horas / 24)} d`;
+  }
+
+  function horaCorta(fechaISO) {
+    if (!fechaISO) return '';
+    const fecha = new Date(fechaISO);
+    if (Number.isNaN(fecha.getTime())) return '';
+    return mismoDia(fecha, new Date()) ? fmtHora24.format(fecha) : fmtFecha.format(fecha);
+  }
+
+  function tarjetaKanban(orden) {
+    const etapa =
+      orden.estado === 'recibido'
+        ? { etiqueta: 'Ingresó', fecha: orden.ingreso }
+        : orden.estado === 'listo'
+          ? { etiqueta: 'Listo', fecha: orden.listoEn }
+          : orden.estado === 'almacen'
+            ? { etiqueta: 'Guardado', fecha: orden.almacen && orden.almacen.desde }
+            : { etiqueta: 'Recogido', fecha: orden.entregadoEn };
+
+    let acciones = '';
+    if (orden.estado === 'recibido') {
+      acciones = `<button class="btn-mini primary" type="button" data-listo="${orden.id}">Ya está listo</button>
+        <button class="btn-mini" type="button" data-ver="${orden.id}">Ver</button>`;
+    } else if (orden.estado === 'listo') {
+      acciones = `<button class="btn-mini" type="button" data-almacen="${orden.id}" title="Guardar en almacén">Almacén</button>
+        <button class="btn-mini primary" type="button" data-salida="${orden.id}">Recogido</button>
+        <button class="btn-mini" type="button" data-ver="${orden.id}">Ver</button>`;
+    } else if (orden.estado === 'almacen') {
+      acciones = `<button class="btn-mini" type="button" data-almacen="${orden.id}" title="Cambiar ubicación">${esc((orden.almacen && orden.almacen.codigo) || 'Ubicación')}</button>
+        <button class="btn-mini primary" type="button" data-salida="${orden.id}">Recogido</button>
+        <button class="btn-mini" type="button" data-ver="${orden.id}">Ver</button>`;
+    } else {
+      acciones = `<button class="btn-mini" type="button" data-ver="${orden.id}">Ver detalle</button>`;
+    }
+
+    return `<article class="kcard">
+      <div class="kcard-top">
+        <span class="kcard-code">${esc(orden.codigo)}</span>
+        <span class="kcard-age">${esc(haceTiempo(etapa.fecha))}</span>
+      </div>
+      <p class="kcard-client">${esc(orden.cliente.nombre)}</p>
+      <p class="kcard-meta">${esc(etapa.etiqueta)} ${esc(horaCorta(etapa.fecha))}${orden.pesoTotal > 0 ? ` · ${Number(orden.pesoTotal).toFixed(2)} kg` : ''} · ${money(orden.total)}</p>
+      ${orden.estado === 'entregado' && orden.recibidoPor ? `<p class="kcard-note">Recogió: ${esc(orden.recibidoPor.nombre)}</p>` : ''}
+      ${orden.estado === 'almacen' && orden.almacen && orden.almacen.nota ? `<p class="kcard-note">${esc(orden.almacen.nota)}</p>` : ''}
+      <div class="kcard-actions">${acciones}</div>
+    </article>`;
+  }
+
+  function columnaKanban(clase, titulo, lista, vacio) {
+    return `<section class="kcol ${clase}">
+      <header class="kcol-head"><h2>${esc(titulo)}</h2><span class="kcount">${lista.length}</span></header>
+      <div class="kcol-body">${lista.length ? lista.map(tarjetaKanban).join('') : `<p class="kempty">${esc(vacio)}</p>`}</div>
+    </section>`;
+  }
+
+  function renderTablero() {
+    const ordenes = Store.getOrdenes();
+    const hoy = new Date();
+
+    const ingresadosHoy = ordenes.filter((o) => mismoDia(new Date(o.ingreso), hoy));
+    const enProceso = ordenes
+      .filter((o) => o.estado === 'recibido')
+      .sort((a, b) => new Date(a.ingreso) - new Date(b.ingreso));
+    const listos = ordenes
+      .filter((o) => o.estado === 'listo')
+      .sort((a, b) => new Date(a.listoEn || a.ingreso) - new Date(b.listoEn || b.ingreso));
+    const almacen = ordenes
+      .filter((o) => o.estado === 'almacen')
+      .sort((a, b) => new Date((a.almacen && a.almacen.desde) || a.ingreso) - new Date((b.almacen && b.almacen.desde) || b.ingreso));
+    const recogidosHoy = ordenes
+      .filter((o) => o.entregadoEn && mismoDia(new Date(o.entregadoEn), hoy))
+      .sort((a, b) => new Date(b.entregadoEn) - new Date(a.entregadoEn));
+
+    const prendasHoy = ingresadosHoy.reduce((acc, o) => acc + (Number(o.prendas) || 0), 0);
+    const kilosHoy = ingresadosHoy.reduce((acc, o) => acc + (Number(o.pesoTotal) || 0), 0);
+    const montoRecogido = recogidosHoy.reduce((acc, o) => acc + (Number(o.total) || 0), 0);
+
+    $('#pipeline').innerHTML = `
+      <div class="pipe-card ingreso"><p class="pipe-label">Ingresados hoy</p><p class="pipe-value">${ingresadosHoy.length}</p><p class="pipe-sub">${prendasHoy} prendas · ${kilosHoy.toFixed(2)} kg</p></div>
+      <div class="pipe-card proceso"><p class="pipe-label">En proceso</p><p class="pipe-value">${enProceso.length}</p><p class="pipe-sub">en taller ahora</p></div>
+      <div class="pipe-card listo"><p class="pipe-label">Listos</p><p class="pipe-value">${listos.length}</p><p class="pipe-sub">para recoger</p></div>
+      <div class="pipe-card almacen"><p class="pipe-label">En almacén</p><p class="pipe-value">${almacen.length}</p><p class="pipe-sub">en resguardo</p></div>
+      <div class="pipe-card recogido"><p class="pipe-label">Recogidos hoy</p><p class="pipe-value">${recogidosHoy.length}</p><p class="pipe-sub">${money(montoRecogido)} entregado</p></div>
+    `;
+
+    $('#kanban').innerHTML = [
+      columnaKanban('proceso', 'En proceso', enProceso, 'Nada en el taller'),
+      columnaKanban('listo', 'Listos', listos, 'Sin prendas listas'),
+      columnaKanban('almacen', 'En almacén', almacen, 'Almacén vacío'),
+      columnaKanban('recogido', 'Recogidos hoy', recogidosHoy, 'Sin recojos hoy')
+    ].join('');
+  }
+
+  /* -------------------------------- Resumen ----------------------------- */
+
+  function renderResumen() {
+    const ordenes = Store.getOrdenes();
+    const hoy = new Date();
+
+    const ingresosDelDia = ordenes.filter((o) => mismoDia(new Date(o.ingreso), hoy));
+    const salidasDelDia = ordenes.filter((o) => o.entregadoEn && mismoDia(new Date(o.entregadoEn), hoy));
+    const enPlanta = ordenes.filter((o) => o.estado !== 'entregado');
+    const listos = ordenes.filter((o) => o.estado === 'listo');
+    const enAlmacen = ordenes.filter((o) => o.estado === 'almacen');
+    const kilosHoy = ingresosDelDia.reduce((acc, o) => acc + (Number(o.pesoTotal) || 0), 0);
+    const facturadoHoy = ingresosDelDia.reduce((acc, o) => acc + (Number(o.total) || 0), 0);
+    const prendasHoy = ingresosDelDia.reduce((acc, o) => acc + (Number(o.prendas) || 0), 0);
+
+    const cobradoHoy = ordenes.reduce((acc, o) => {
+      const movimientos = datosPago(o).movimientos;
+      return acc + movimientos
+        .filter((m) => m && m.fecha && mismoDia(new Date(m.fecha), hoy))
+        .reduce((suma, m) => suma + (Number(m.monto) || 0), 0);
+    }, 0);
+
+    // Cuenta todo saldo abierto, también el de órdenes ya entregadas: si el
+    // cliente se llevó las prendas sin pagar el saldo, sigue siendo deuda.
+    const porCobrar = ordenes.reduce((acc, o) => acc + Math.max(0, datosPago(o).saldo), 0);
+
+    $('#metrics').innerHTML = `
+      <div class="metric"><p class="metric-label">Ingresos hoy</p><p class="metric-value">${ingresosDelDia.length}</p><p class="metric-sub">${prendasHoy} prendas registradas</p></div>
+      <div class="metric"><p class="metric-label">Salidas hoy</p><p class="metric-value">${salidasDelDia.length}</p><p class="metric-sub">${enPlanta.length} en planta · ${enAlmacen.length} en almacén</p></div>
+      <div class="metric"><p class="metric-label">Kilos hoy</p><p class="metric-value">${kilosHoy.toFixed(2)}</p><p class="metric-sub">pesados en mostrador</p></div>
+      <div class="metric"><p class="metric-label">Facturado hoy</p><p class="metric-value">${money(facturadoHoy)}</p><p class="metric-sub">servicios del día</p></div>
+      <div class="metric"><p class="metric-label">Cobrado hoy</p><p class="metric-value">${money(cobradoHoy)}</p><p class="metric-sub">pagos y adelantos</p></div>
+      <div class="metric"><p class="metric-label">Por cobrar</p><p class="metric-value">${money(porCobrar)}</p><p class="metric-sub">saldo de todas las órdenes</p></div>
+    `;
+
+    const dias = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() - i);
+      const total = ordenes
+        .filter((o) => mismoDia(new Date(o.ingreso), d))
+        .reduce((acc, o) => acc + (Number(o.total) || 0), 0);
+      dias.push({ fecha: d, total, hoy: i === 0 });
+    }
+    const maximo = Math.max(...dias.map((d) => d.total), 1);
+    const etiquetaDia = new Intl.DateTimeFormat('es-PE', { weekday: 'short' });
+
+    $('#chartSemana').innerHTML = dias
+      .map(
+        (d) => `<div class="bar-wrap${d.hoy ? ' hoy' : ''}">
+          <span class="bar-value">${d.total > 0 ? Math.round(d.total) : ''}</span>
+          <div class="bar" style="height:${Math.max(4, (d.total / maximo) * 100)}%"><i></i></div>
+          <span class="bar-label">${esc(etiquetaDia.format(d.fecha).replace('.', ''))}</span>
+        </div>`
+      )
+      .join('');
+
+    const recojos = ordenes
+      .filter((o) => o.estado !== 'entregado' && mismoDia(new Date(o.recojoEn), hoy))
+      .sort((a, b) => new Date(a.recojoEn) - new Date(b.recojoEn));
+
+    $('#recojosHoy').innerHTML = recojos.length
+      ? recojos
+          .map(
+            (o) => `<div class="recojo-item">
+              <span class="hora">${fmtHora24.format(new Date(o.recojoEn))}</span>
+              <div class="quien"><strong>${esc(o.cliente.nombre)}</strong><span>${esc(o.codigo)} · ${money(o.total)}</span></div>
+              <button class="btn-mini wa" type="button" data-wa="${o.id}">Avisar</button>
+            </div>`
+          )
+          .join('')
+      : '<p class="sin-datos">No hay recojos programados para hoy.</p>';
+
+    const filaMov = (o, fecha) => `<li class="mov-item">
+        <span class="mov-hora">${fmtHora24.format(new Date(fecha))}</span>
+        <div><strong>${esc(o.cliente.nombre)}</strong><span>${esc(o.codigo)} · ${money(o.total)}</span></div>
+      </li>`;
+
+    const ingresosOrdenados = ingresosDelDia.slice().sort((a, b) => new Date(a.ingreso) - new Date(b.ingreso));
+    const salidasOrdenadas = salidasDelDia.slice().sort((a, b) => new Date(a.entregadoEn) - new Date(b.entregadoEn));
+
+    $('#movimientos').innerHTML = `
+      <div class="mov-col">
+        <h3>Ingresos <span class="badge">${ingresosOrdenados.length}</span></h3>
+        <ul>${ingresosOrdenados.map((o) => filaMov(o, o.ingreso)).join('') || '<li class="sin-datos">Sin ingresos registrados hoy.</li>'}</ul>
+      </div>
+      <div class="mov-col salidas">
+        <h3>Salidas <span class="badge">${salidasOrdenadas.length}</span></h3>
+        <ul>${salidasOrdenadas.map((o) => filaMov(o, o.entregadoEn)).join('') || '<li class="sin-datos">Sin salidas registradas hoy.</li>'}</ul>
+      </div>`;
+  }
+
+  /* ------------------------------ Eventos ------------------------------- */
+
+  function conectarEventos() {
+    $('#formLogin').addEventListener('submit', iniciarSesion);
+
+    $('#btnSalir').addEventListener('click', cerrarSesion);
+    $('#btnDatos').addEventListener('click', abrirDatos);
+    $('#btnVerAvisos').addEventListener('click', abrirModalAvisos);
+    $('#modalCerrar').addEventListener('click', cerrarModal);
+
+    // Panel de precios
+    // Menú de cuenta: un botón despliega Perfiles, Precios, Datos y Salir.
+    const botonMenu = $('#btnMenu');
+    const menuCuenta = $('#menuCuenta');
+    botonMenu.addEventListener('click', (evento) => {
+      evento.stopPropagation();
+      const abierto = !menuCuenta.hidden;
+      menuCuenta.hidden = abierto;
+      botonMenu.setAttribute('aria-expanded', String(!abierto));
+    });
+    menuCuenta.addEventListener('click', (evento) => {
+      if (evento.target.closest('.menu-item')) cerrarMenuCuenta();
+    });
+    document.addEventListener('click', (evento) => {
+      if (!evento.target.closest('#cuenta')) cerrarMenuCuenta();
+    });
+    document.addEventListener('keydown', (evento) => {
+      if (evento.key === 'Escape') cerrarMenuCuenta();
+    });
+
+    $('#btnPerfiles').addEventListener('click', abrirPerfiles);
+    $('#cerrarPerfiles').addEventListener('click', cerrarPerfiles);
+    $('#btnNuevoUsuario').addEventListener('click', () => modalUsuario(null));
+    $('#btnNuevoTicket').addEventListener('click', modalNuevoTicket);
+
+    // Delegación: el contenido del panel se vuelve a dibujar a cada cambio.
+    $('#panelPerfiles').addEventListener('click', (evento) => {
+      const clave = evento.target.closest('[data-clave]');
+      if (clave) { modalClave(clave.dataset.clave); return; }
+      const editar = evento.target.closest('[data-editar]');
+      if (editar) { modalUsuario(editar.dataset.editar); return; }
+      const ver = evento.target.closest('[data-ver]');
+      if (ver) { modalTicket(ver.dataset.ver); return; }
+      const cerrar = evento.target.closest('[data-cerrar-ticket]');
+      if (cerrar) { cerrarTicket(cerrar.dataset.cerrarTicket); return; }
+      const borrar = evento.target.closest('[data-borrar]');
+      if (borrar) { confirmarBorrarUsuario(borrar.dataset.borrar); return; }
+      const estadoBoton = evento.target.closest('[data-estado]');
+      if (estadoBoton && esAdmin()) {
+        const cuenta = directorio().find((u) => u.id === estadoBoton.dataset.estado);
+        if (!cuenta) return;
+        if (cuenta.activo !== false && /admin/i.test(cuenta.rol) && !adminsRestantes(cuenta.id)) {
+          toast('Debe quedar al menos un administrador activo');
+          return;
+        }
+        Store.actualizarUsuario(cuenta.id, { activo: cuenta.activo === false });
+        renderPerfiles();
+        toast(cuenta.activo === false ? 'Cuenta activada' : 'Cuenta desactivada');
+      }
+    });
+
+    $('#btnPrecios').addEventListener('click', abrirPrecios);
+    $('#cerrarPrecios').addEventListener('click', cerrarPrecios);
+    $('#guardarPrecios').addEventListener('click', guardarPrecios);
+    $('#restablecerPrecios').addEventListener('click', restablecerPrecios);
+    $('#buscarPrecio').addEventListener('input', renderPrecios);
+    $('#btnAutorizarCodigo').addEventListener('click', abrirModalAutorizar);
+    $('#btnCodigoPrecios').addEventListener('click', () => abrirModalCodigo(permisoPrecios()));
+    $('#btnSolicitudes').addEventListener('click', abrirSolicitudes);
+    $('#btnHistorial').addEventListener('click', abrirHistorial);
+
+    // «Pedir» en cada servicio bloqueado: envía la solicitud al administrador.
+    $('#listaPrecios').addEventListener('click', (evento) => {
+      const boton = evento.target.closest('[data-pedir]');
+      if (boton) abrirSolicitud(boton.dataset.pedir);
+    });
+
+    $('#panelPrecios').addEventListener('click', (evento) => {
+      if (evento.target.closest('[data-cerrar-panel]')) cerrarPrecios();
+    });
+
+    $('#panelPerfiles').addEventListener('click', (evento) => {
+      if (evento.target.closest('[data-cerrar-perfiles]')) cerrarPerfiles();
+    });
+
+    $('#listaPrecios').addEventListener('input', (evento) => {
+      const campo = evento.target.closest('[data-precio]');
+      if (!campo || !borradorPrecios) return;
+      borradorPrecios[campo.dataset.precio] = campo.value;
+    });
+
+    // Los precios del panel también se normalizan a dos decimales al salir.
+    $('#listaPrecios').addEventListener('blur', (evento) => {
+      const campo = evento.target.closest('[data-precio]');
+      if (!campo || !borradorPrecios) return;
+      campo.value = Math.max(parseNum(campo.value), 0).toFixed(2);
+      borradorPrecios[campo.dataset.precio] = campo.value;
+    }, true);
+
+    $$('.tab').forEach((tab) => tab.addEventListener('click', () => cambiarVista(tab.dataset.vista)));
+
+    // Catálogo
+    $('#categorias').addEventListener('click', (evento) => {
+      const chip = evento.target.closest('[data-categoria]');
+      if (!chip) return;
+      estado.categoria = chip.dataset.categoria;
+      renderCatalogo();
+    });
+
+    $('#catalogo').addEventListener('click', (evento) => {
+      const boton = evento.target.closest('[data-servicio]');
+      if (boton) agregarServicio(boton.dataset.servicio);
+    });
+
+    // Ítems
+    $('#items').addEventListener('input', (evento) => {
+      const campo = evento.target.closest('[data-campo]');
+      if (!campo) return;
+      const fila = campo.closest('.item');
+      const item = estado.items.find((i) => i.key === fila.dataset.key);
+      if (!item) return;
+      item[campo.dataset.campo] = campo.value;
+      refrescarSubtotales();
+      refrescarResumen();
+      const nota = fila.querySelector('.item-note');
+      if (nota) nota.remove();
+      if (item.tipo === 'peso' && item.minPeso && parseNum(item.cantidad) > 0 && parseNum(item.cantidad) < item.minPeso) {
+        fila.insertAdjacentHTML('beforeend', `<p class="item-note">Se aplica el mínimo de ${item.minPeso} kg para este servicio.</p>`);
+      }
+    });
+
+    // Al salir del campo, el precio unitario queda con dos decimales.
+    $('#items').addEventListener('blur', (evento) => {
+      const campo = evento.target.closest('[data-campo="tarifa"]');
+      if (!campo) return;
+      const fila = campo.closest('.item');
+      const item = estado.items.find((i) => i.key === fila.dataset.key);
+      if (!item) return;
+      campo.value = Math.max(parseNum(campo.value), 0).toFixed(2);
+      item.tarifa = campo.value;
+      refrescarSubtotales();
+      refrescarResumen();
+    }, true);
+
+    $('#items').addEventListener('click', (evento) => {
+      const boton = evento.target.closest('[data-accion="quitar"]');
+      if (!boton) return;
+      const fila = boton.closest('.item');
+      estado.items = estado.items.filter((i) => i.key !== fila.dataset.key);
+      renderItems();
+      refrescarResumen();
+    });
+
+    // Cliente
+    let temporizador;
+    $('#cliTelefono').addEventListener('input', () => {
+      clearTimeout(temporizador);
+      temporizador = setTimeout(buscarCliente, 350);
+    });
+    $('#cliNombre').addEventListener('input', actualizarAviso);
+
+    // Asistente: pasos con confirmación
+    $$('#pasosNav .paso-tab').forEach((tab) => {
+      tab.addEventListener('click', () => irAPaso(tab.dataset.ir));
+    });
+    $('#pasoSiguiente1').addEventListener('click', () => irAPaso(2));
+    $('#pasoAtras2').addEventListener('click', () => irAPaso(1));
+    $('#pasoSiguiente2').addEventListener('click', () => irAPaso(3));
+    $('#pasoAtras3').addEventListener('click', () => irAPaso(2));
+    $('#pasoSiguiente3').addEventListener('click', () => irAPaso(4));
+    $('#pasoAtras4').addEventListener('click', () => irAPaso(3));
+
+    // Recepción: peso o conteo
+    $('#recepcionModos').addEventListener('click', (evento) => {
+      const boton = evento.target.closest('[data-modo]');
+      if (boton) seleccionarModoRecepcion(boton.dataset.modo);
+    });
+    $('#btnVerTodos').addEventListener('click', () => {
+      estado.verTodos = !estado.verTodos;
+      renderCatalogo();
+    });
+
+    // Proceso sugerido
+    $('#procesoChips').addEventListener('click', (evento) => {
+      const chip = evento.target.closest('[data-proceso]');
+      if (chip) elegirProceso(chip.dataset.proceso);
+    });
+
+    // Recojo y entrega
+    $('#recojo').addEventListener('change', () => {
+      estado.recojoManual = true;
+      actualizarAviso();
+      refrescarResumen();
+    });
+
+    // Tira de la semana
+    $('#semana').addEventListener('click', (evento) => {
+      const tarjeta = evento.target.closest('[data-dia]');
+      if (tarjeta) seleccionarDia(tarjeta.dataset.dia);
+    });
+
+    $('#semanaPrev').addEventListener('click', () => {
+      estado.offsetSemana = Math.max(0, estado.offsetSemana - 7);
+      renderSemana();
+    });
+
+    $('#semanaNext').addEventListener('click', () => {
+      estado.offsetSemana += 7;
+      renderSemana();
+    });
+
+    $('#semanaFuera').addEventListener('click', (evento) => {
+      if (!evento.target.closest('#semanaVolver')) return;
+      const recojo = fechaRecojo();
+      if (!recojo) return;
+      const diferencia = Math.round((soloDia(recojo) - soloDia(new Date())) / 86400000);
+      estado.offsetSemana = diferencia > 6 ? Math.floor(diferencia / 7) * 7 : 0;
+      renderSemana();
+    });
+
+    $('#horaRecojo').addEventListener('change', () => {
+      const recojo = fechaRecojo();
+      if (!recojo) return;
+      $('#recojo').value = `${isoDia(recojo)}T${$('#horaRecojo').value || '08:00'}`;
+      renderSemana();
+      actualizarHintRecojo(false);
+      actualizarAviso();
+    });
+    $('#tipoEntrega').addEventListener('change', actualizarEntrega);
+    $('#costoEnvio').addEventListener('input', refrescarResumen);
+    $('#direccionEntrega').addEventListener('input', actualizarAviso);
+    $('#descuento').addEventListener('input', refrescarResumen);
+    $('#descuento').addEventListener('blur', () => {
+      const totales = calcularTotales();
+      if (parseNum($('#descuento').value) > totales.subtotal) {
+        $('#descuento').value = totales.subtotal.toFixed(2);
+        refrescarResumen();
+      }
+    });
+
+    // Pago
+    $('#estadoPago').addEventListener('change', () => refrescarResumen());
+    $('#montoAdelanto').addEventListener('input', () => refrescarResumen());
+    $('#montoAdelanto').addEventListener('blur', () => {
+      const total = calcularTotales().total;
+      const monto = Math.min(Math.max(parseNum($('#montoAdelanto').value), 0), total);
+      $('#montoAdelanto').value = monto.toFixed(2);
+      refrescarResumen();
+    });
+
+    // Todos los montos editables se muestran siempre con dos decimales.
+    ['#descuento', '#costoEnvio'].forEach((sel) => {
+      $(sel).addEventListener('blur', () => {
+        const campo = $(sel);
+        campo.value = Math.max(parseNum(campo.value), 0).toFixed(2);
+        refrescarResumen();
+      });
+    });
+
+    $('#btnRegistrar').addEventListener('click', () => registrar('whatsapp'));
+    $('#btnRegistrarImprimir').addEventListener('click', () => registrar('imprimir'));
+    $('#btnRegistrarSin').addEventListener('click', () => registrar('ninguno'));
+
+    // Órdenes
+    $('#buscarOrden').addEventListener('input', renderOrdenes);
+    $('#filtroEstado').addEventListener('change', renderOrdenes);
+
+    $('#tablaOrdenes').addEventListener('click', (evento) => {
+      const ver = evento.target.closest('[data-ver]');
+      const wa = evento.target.closest('[data-wa]');
+      const salida = evento.target.closest('[data-salida]');
+      const almacen = evento.target.closest('[data-almacen]');
+      const listo = evento.target.closest('[data-listo]');
+      const imprimir = evento.target.closest('[data-print]');
+      const cobrar = evento.target.closest('[data-cobrar]');
+      if (ver) abrirDetalle(ver.dataset.ver);
+      if (cobrar) abrirCobro(cobrar.dataset.cobrar);
+      if (almacen) abrirAlmacen(almacen.dataset.almacen);
+      if (listo) marcarListo(listo.dataset.listo, true, false);
+      if (wa) {
+        const orden = Store.getOrden(wa.dataset.wa);
+        enviarComprobante(orden, tipoAvisoSugerido(orden));
+      }
+      if (salida) confirmarSalida(salida.dataset.salida);
+      if (imprimir) imprimirOrden(Store.getOrden(imprimir.dataset.print));
+    });
+
+    $('#kanban').addEventListener('click', (evento) => {
+      const listo = evento.target.closest('[data-listo]');
+      const almacen = evento.target.closest('[data-almacen]');
+      const salida = evento.target.closest('[data-salida]');
+      const ver = evento.target.closest('[data-ver]');
+
+      if (listo) marcarListo(listo.dataset.listo, true, false);
+      if (almacen) abrirAlmacen(almacen.dataset.almacen);
+      if (salida) confirmarSalida(salida.dataset.salida);
+      if (ver) abrirDetalle(ver.dataset.ver);
+    });
+
+    $('#buscarCliente').addEventListener('input', renderClientes);
+    $('#tablaClientes').addEventListener('click', (evento) => {
+      const boton = evento.target.closest('[data-editar-cliente]');
+      if (boton) modalCliente(boton.dataset.editarCliente);
+    });
+
+    $('#recojosHoy').addEventListener('click', (evento) => {
+      const boton = evento.target.closest('[data-wa]');
+      if (boton) enviarComprobante(Store.getOrden(boton.dataset.wa), 'listo');
+    });
+
+    // Modal
+    $('#modal').addEventListener('click', (evento) => {
+      const cerrar = evento.target.closest('[data-accion="cerrar"]');
+      if (cerrar) {
+        cerrarModal();
+        return;
+      }
+
+      // Ancho del papel de la impresora térmica.
+      const ancho = evento.target.closest('#anchoTicket [data-ancho]');
+      if (ancho) {
+        Ticket.guardar({ ancho: Number(ancho.dataset.ancho) });
+        $$('#anchoTicket [data-ancho]').forEach((boton) => {
+          boton.classList.toggle('is-active', boton === ancho);
+        });
+        toast(`Ticket configurado para ${ancho.dataset.ancho} mm`);
+        return;
+      }
+
+      const aprobar = evento.target.closest('[data-aprobar]');
+      if (aprobar) {
+        aplicarSolicitud(aprobar.dataset.aprobar);
+        return;
+      }
+
+      const cerrarTk = evento.target.closest('[data-cerrar-ticket]');
+      if (cerrarTk) {
+        cerrarTicket(cerrarTk.dataset.cerrarTicket);
+        return;
+      }
+
+      const rechazar = evento.target.closest('[data-rechazar]');
+      if (rechazar) {
+        rechazarSolicitud(rechazar.dataset.rechazar);
+        return;
+      }
+
+      const listo = evento.target.closest('[data-listo]');
+      if (listo) {
+        marcarListo(listo.dataset.listo);
+        return;
+      }
+
+      const salida = evento.target.closest('[data-salida]');
+      if (salida) {
+        confirmarSalida(salida.dataset.salida);
+        return;
+      }
+
+      const cobrar = evento.target.closest('[data-cobrar]');
+      if (cobrar) {
+        abrirCobro(cobrar.dataset.cobrar);
+        return;
+      }
+
+      const confirmarCobroBtn = evento.target.closest('[data-confirmar-cobro]');
+      if (confirmarCobroBtn) {
+        confirmarCobro(confirmarCobroBtn.dataset.confirmarCobro);
+        return;
+      }
+
+      const verificar = evento.target.closest('[data-verificar]');
+      if (verificar) {
+        verificarCodigo(verificar.dataset.verificar);
+        return;
+      }
+
+      const confirmar = evento.target.closest('[data-confirmar-salida]');
+      if (confirmar) {
+        ejecutarEntrega(confirmar.dataset.confirmarSalida);
+        return;
+      }
+
+      const almacen = evento.target.closest('[data-almacen]');
+      if (almacen) {
+        abrirAlmacen(almacen.dataset.almacen);
+        return;
+      }
+
+      const guardarAlmacenBtn = evento.target.closest('[data-guardar-almacen]');
+      if (guardarAlmacenBtn) {
+        guardarAlmacen(guardarAlmacenBtn.dataset.guardarAlmacen);
+        return;
+      }
+
+      const quitarAlmacenBtn = evento.target.closest('[data-quitar-almacen]');
+      if (quitarAlmacenBtn) {
+        quitarAlmacen(quitarAlmacenBtn.dataset.quitarAlmacen);
+        return;
+      }
+
+      const reenvio = evento.target.closest('[data-aviso]');
+      if (reenvio) registrarReenvio(reenvio.dataset.aviso);
+
+      const accion = evento.target.closest('[data-accion]');
+      if (accion) {
+        const id = accion.dataset.id;
+        const orden = id ? Store.getOrden(id) : null;
+        if (accion.dataset.accion === 'whatsapp' && orden) enviarComprobante(orden, tipoAvisoSugerido(orden));
+        if (accion.dataset.accion === 'comprobante' && orden) {
+          enviarComprobante(orden, tipoAvisoSugerido(orden));
+          return;
+        }
+        if (accion.dataset.accion === 'copiar-imagen') {
+          copiarImagenComprobante();
+          return;
+        }
+        if (accion.dataset.accion === 'descargar-comprobante') {
+          descargarComprobante();
+          return;
+        }
+        if (accion.dataset.accion === 'abrir-wa' && estado.comprobante && orden) {
+          window.open(`https://wa.me/${normalizarTelefono(orden.cliente.telefono)}`, '_blank', 'noopener');
+          toast('Pega la imagen en el chat con Ctrl + V');
+          return;
+        }
+        if (accion.dataset.accion === 'copiar' && orden) copiarMensaje(orden);
+        if (accion.dataset.accion === 'imprimir' && orden) imprimirOrden(orden);
+        if (accion.dataset.accion === 'respaldo') exportarRespaldo();
+        if (accion.dataset.accion === 'csv') exportarCSV();
+        if (accion.dataset.accion === 'importar') $('#archivoRespaldo').click();
+        if (accion.dataset.accion === 'prueba-ticket') {
+          Ticket.prueba();
+          return;
+        }
+      }
+      const cambio = evento.target.closest('[data-estado]');
+      if (cambio) cambiarEstado(cambio.dataset.id, cambio.dataset.estado);
+    });
+
+    $('#modal').addEventListener('change', (evento) => {
+      if (evento.target.id === 'archivoRespaldo' && evento.target.files[0]) {
+        importarRespaldo(evento.target.files[0]);
+      }
+    });
+
+    $('#modal').addEventListener('input', (evento) => {
+      if (evento.target.id !== 'codigoVerifica') return;
+      evento.target.classList.remove('invalid');
+      $('#verificaMsg').textContent = 'Últimos 4 o 5 números del comprobante; también vale el código completo.';
+      $('#verificaMsg').className = 'hint';
+      $('#btnConfirmarEntrega').disabled = true;
+    });
+
+    $('#modal').addEventListener('keydown', (evento) => {
+      if (evento.key === 'Enter' && evento.target.id === 'codigoVerifica') {
+        evento.preventDefault();
+        verificarCodigo(evento.target.dataset.orden);
+      }
+    });
+
+    document.addEventListener('keydown', (evento) => {
+      if (evento.key !== 'Escape') return;
+      if ($('#modal').classList.contains('is-open')) cerrarModal();
+      else if ($('#panelPrecios').classList.contains('is-open')) cerrarPrecios();
+    });
+  }
+
+  /* --------------------------- Intro de marca --------------------------- */
+
+  /* Tres segundos de presentación al abrir. Se puede saltar con un toque o
+     Escape, y no retiene al operador: si tarda, la app ya cargó detrás. */
+  function iniciarIntro() {
+    const intro = document.getElementById('intro');
+    if (!intro) return;
+
+    const reducido = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const duracion = reducido ? 1200 : 3000;
+    intro.style.setProperty('--intro', `${duracion}ms`);
+
+    let saliendo = false;
+    const salir = () => {
+      if (saliendo) return;
+      saliendo = true;
+      intro.classList.add('is-out');
+      window.setTimeout(() => intro.remove(), 500);
+    };
+
+    window.setTimeout(salir, duracion);
+    intro.addEventListener('click', salir);
+    intro.addEventListener('touchstart', salir, { passive: true });
+    document.addEventListener('keydown', (evento) => {
+      if (evento.key === 'Escape' || evento.key === 'Enter') salir();
+    });
+  }
+
+  /* ------------------------- Perfiles y soporte -------------------------- */
+
+  const CATEGORIAS_TICKET = ['Acceso', 'Precios', 'Órdenes', 'Sincronización', 'Sugerencia', 'Otro'];
+  const NOMBRE_ESTADO = { abierta: 'Abierta', 'en proceso': 'En proceso', cerrada: 'Cerrada' };
+
+  const iniciales = (nombre) =>
+    String(nombre || '?')
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((p) => p[0].toUpperCase())
+      .join('');
+
+  const fechaCorta = (iso) => {
+    const fecha = new Date(iso);
+    if (!Number.isFinite(fecha.getTime())) return '';
+    return fecha.toLocaleDateString('es-PE', { day: '2-digit', month: 'short' }) + ' · ' + fmtHora24.format(fecha);
+  };
+
+  function abrirPerfiles() {
+    if ($('#modal').classList.contains('is-open')) cerrarModal();
+    if ($('#panelPrecios').classList.contains('is-open')) cerrarPrecios();
+    renderPerfiles();
+    $('#panelPerfiles').classList.add('is-open');
+    $('#panelPerfiles').setAttribute('aria-hidden', 'false');
+  }
+
+  function cerrarPerfiles() {
+    $('#panelPerfiles').classList.remove('is-open');
+    $('#panelPerfiles').setAttribute('aria-hidden', 'true');
+  }
+
+  /* Contador del botón: al admin le cuentan los tickets sin cerrar; al
+     operador, los suyos que siguen en curso. */
+  function actualizarBadgeTickets() {
+    const tickets = Store.getTickets();
+    const pendientes = esAdmin()
+      ? tickets.filter((t) => t.estado !== 'cerrada')
+      : tickets.filter((t) => t.estado !== 'cerrada' && t.autor === (estado.operador && estado.operador.nombre));
+    const badge = $('#badgeTickets');
+    badge.hidden = pendientes.length === 0;
+    badge.textContent = String(pendientes.length);
+  }
+
+  function renderPerfiles() {
+    const yo = estado.operador || { nombre: 'Sin sesión', usuario: '', rol: '' };
+    const admin = esAdmin();
+    const usuarios = directorio();
+
+    // --- mi cuenta ---
+    const propia = buscarUsuario(yo.usuario);
+    $('#miPerfil').innerHTML = `
+      <div class="perfil-head"><h3>Mi cuenta</h3></div>
+      <div class="perfil-card">
+        <span class="perfil-avatar">${esc(iniciales(yo.nombre))}</span>
+        <div class="perfil-datos">
+          <strong>${esc(yo.nombre)}</strong>
+          <span>${esc(yo.rol)} · ${esc(yo.usuario)}</span>
+          ${propia && propia.ultimoAcceso ? `<span class="muted small">Último acceso: ${fechaCorta(propia.ultimoAcceso)}</span>` : ''}
+        </div>
+      </div>
+      <div class="perfil-acciones">
+        <button class="btn btn-outline btn-mini" type="button" data-clave="${propia ? esc(propia.id) : ''}">Cambiar mi clave</button>
+        ${admin ? '<a class="btn btn-outline btn-mini" href="soporte/" target="_blank" rel="noopener">Panel de soporte</a>' : ''}
+      </div>`;
+
+    // --- usuarios (solo administración) ---
+    const seccion = $('#seccionUsuarios');
+    seccion.hidden = !admin;
+    if (admin) {
+      $('#listaUsuarios').innerHTML = usuarios
+        .map((u) => {
+          const soyYo = String(u.usuario).toLowerCase() === String(yo.usuario).toLowerCase();
+          const estadoTexto = u.activo === false ? 'Desactivado' : 'Activo';
+          return `<div class="usuario-row${u.activo === false ? ' is-off' : ''}">
+            <span class="perfil-avatar chico">${esc(iniciales(u.nombre))}</span>
+            <div class="usuario-info">
+              <strong>${esc(u.nombre)}${soyYo ? ' <span class="marca-yo">tú</span>' : ''}</strong>
+              <span>${esc(u.usuario)} · ${esc(u.rol)} · ${estadoTexto}</span>
+            </div>
+            <div class="usuario-acciones">
+              <button class="btn btn-mini" type="button" data-editar="${esc(u.id)}">Editar</button>
+              <button class="btn btn-mini" type="button" data-clave="${esc(u.id)}">Clave</button>
+              ${soyYo ? '' : `<button class="btn btn-mini" type="button" data-estado="${esc(u.id)}">${u.activo === false ? 'Activar' : 'Desactivar'}</button>
+              <button class="btn btn-mini btn-danger-ghost" type="button" data-borrar="${esc(u.id)}">Eliminar</button>`}
+            </div>
+          </div>`;
+        })
+        .join('');
+    } else {
+      // Al mostrador no se le deja ni el marcado de las cuentas en el DOM.
+      $('#listaUsuarios').innerHTML = '';
+    }
+
+    // --- soporte ---
+    const tickets = Store.getTickets()
+      .filter((t) => admin || t.autor === yo.nombre)
+      .slice(0, 40);
+    $('#soporteInfo').textContent = CONFIG.soporte && CONFIG.soporte.correo
+      ? `Escríbenos también a ${CONFIG.soporte.correo}${CONFIG.soporte.horario ? ' · ' + CONFIG.soporte.horario : ''}`
+      : 'Cuéntanos qué pasa y queda registrado para que lo revisemos.';
+
+    $('#listaTickets').innerHTML = tickets.length
+      ? tickets
+          .map(
+            (t) => `<button class="ticket-row" type="button" data-ver="${esc(t.id)}">
+              <span class="ticket-texto">
+                <strong>${esc(t.asunto)}</strong>
+                <span>${esc(t.autor)} · ${fechaCorta(t.fecha)} · ${esc(t.categoria)}</span>
+              </span>
+              <span class="ticket-estado e-${esc(String(t.estado).replace(' ', '-'))}">${esc(NOMBRE_ESTADO[t.estado] || t.estado)}</span>
+            </button>`
+          )
+          .join('')
+      : '<p class="muted small">Aún no hay tickets.</p>';
+
+    actualizarBadgeTickets();
+  }
+
+  /* --------------------------- Modales de cuenta -------------------------- */
+
+  function modalClave(idUsuario) {
+    const esPropia = String(idUsuario) === String((buscarUsuario(estado.operador.usuario) || {}).id);
+    // Cambiar la clave de otra persona es cosa de administración.
+    if (!esPropia && !esAdmin()) {
+      toast('Solo el administrador cambia claves de otros');
+      return;
+    }
+    const usuario = directorio().find((u) => u.id === idUsuario);
+    if (!usuario) {
+      toast('No encontré esa cuenta');
+      return;
+    }
+
+    abrirModal(`
+      <h2>${esPropia ? 'Cambiar mi clave' : 'Cambiar clave de ' + esc(usuario.nombre)}</h2>
+      <p class="muted small">${esPropia ? 'Necesitas tu clave actual.' : 'El cambio se aplica al instante en este equipo.'}</p>
+      <form id="formClave" class="form-codigo" autocomplete="off">
+        ${esPropia ? `<label class="field"><span>Clave actual</span><input id="claveActual" type="password" autocomplete="current-password" required /></label>` : ''}
+        <label class="field"><span>Clave nueva</span><input id="claveNueva" type="password" minlength="4" autocomplete="new-password" required /></label>
+        <label class="field"><span>Repite la clave</span><input id="claveRepite" type="password" minlength="4" autocomplete="new-password" required /></label>
+        <p class="form-error" id="claveError" role="alert"></p>
+        <div class="modal-acciones">
+          <button class="btn btn-primary" type="submit">Guardar clave</button>
+          <button class="btn btn-outline" type="button" data-accion="cerrar">Cancelar</button>
+        </div>
+      </form>`);
+
+    $('#formClave').addEventListener('submit', (evento) => {
+      evento.preventDefault();
+      const nueva = $('#claveNueva').value.trim();
+      const repite = $('#claveRepite').value.trim();
+      const error = $('#claveError');
+
+      if (esPropia && $('#claveActual').value.trim() !== String(usuario.clave)) {
+        error.textContent = 'La clave actual no es correcta.';
+        return;
+      }
+      if (nueva.length < 4) {
+        error.textContent = 'Usa al menos 4 caracteres.';
+        return;
+      }
+      if (nueva !== repite) {
+        error.textContent = 'Las claves no coinciden.';
+        return;
+      }
+
+      Store.actualizarUsuario(usuario.id, { clave: nueva });
+      Store.registrarAuditoria({
+        operador: estado.operador.nombre,
+        rol: estado.operador.rol,
+        via: 'cuenta',
+        cambios: [],
+        detalle: esPropia ? 'Cambió su clave' : `Cambió la clave de ${usuario.nombre}`
+      });
+      cerrarModal();
+      renderPerfiles();
+      toast('Clave actualizada');
+    });
+
+    setTimeout(() => { const campo = $('#claveActual') || $('#claveNueva'); if (campo) campo.focus(); }, 100);
+  }
+
+  /** Administradores activos que quedarían si se quita a este usuario. */
+  function adminsRestantes(id) {
+    return directorio().filter((u) => u.id !== id && u.activo !== false && /admin/i.test(u.rol)).length;
+  }
+
+  /** Eliminar una cuenta: confirmación aparte y sin dejar el sistema sin admin. */
+  function confirmarBorrarUsuario(id) {
+    if (!esAdmin()) {
+      toast('Solo el administrador gestiona usuarios');
+      return;
+    }
+    const cuenta = directorio().find((u) => u.id === id);
+    if (!cuenta) return;
+
+    const yo = estado.operador || {};
+    if (String(cuenta.usuario).toLowerCase() === String(yo.usuario || '').toLowerCase()) {
+      toast('No puedes eliminar tu propia cuenta');
+      return;
+    }
+    if (/admin/i.test(cuenta.rol) && !adminsRestantes(cuenta.id)) {
+      toast('Debe quedar al menos un administrador activo');
+      return;
+    }
+
+    abrirModal(`
+      <h2>Eliminar usuario</h2>
+      <p class="muted small">Se borra la cuenta de <strong>${esc(cuenta.nombre)}</strong> (${esc(cuenta.usuario)}). Esta acción no se puede deshacer.</p>
+      <p class="muted small">Las órdenes y los clientes que registró se conservan.</p>
+      <div class="modal-acciones">
+        <button class="btn btn-primary btn-danger" type="button" data-confirmar-borrar="${esc(cuenta.id)}">Eliminar cuenta</button>
+        <button class="btn btn-outline" type="button" data-accion="cerrar">Cancelar</button>
+      </div>`);
+
+    $('#modalContenido')
+      .querySelector('[data-confirmar-borrar]')
+      .addEventListener('click', (evento) => {
+        Store.borrarUsuario(cuenta.id);
+        cerrarModal();
+        renderPerfiles();
+        toast('Usuario eliminado');
+        evento.stopPropagation();
+      });
+  }
+
+  function modalUsuario(id) {
+    if (!esAdmin()) {
+      toast('Solo el administrador gestiona usuarios');
+      return;
+    }
+    const usuario = id ? directorio().find((u) => u.id === id) : null;
+    const editando = Boolean(usuario);
+
+    abrirModal(`
+      <h2>${editando ? 'Editar usuario' : 'Nuevo usuario'}</h2>
+      <p class="muted small">${editando ? 'El cambio se guarda en este equipo y se sincroniza.' : 'Podrá entrar con el usuario y la clave que definas aquí.'}</p>
+      <form id="formUsuario" class="form-codigo" autocomplete="off">
+        <label class="field"><span>Nombre completo</span><input id="uNombre" type="text" value="${editando ? esc(usuario.nombre) : ''}" required /></label>
+        <label class="field"><span>Usuario</span><input id="uUsuario" type="text" value="${editando ? esc(usuario.usuario) : ''}" ${editando ? 'readonly' : ''} required /></label>
+        <label class="field"><span>Rol</span>
+          <select id="uRol">
+            <option value="Operador"${editando && !/admin/i.test(usuario.rol) ? ' selected' : ''}>Operador</option>
+            <option value="Administrador"${editando && /admin/i.test(usuario.rol) ? ' selected' : ''}>Administrador</option>
+          </select>
+        </label>
+        ${editando ? '' : '<label class="field"><span>Clave</span><input id="uClave" type="password" minlength="4" autocomplete="new-password" required /></label>'}
+        <p class="form-error" id="usuarioError" role="alert"></p>
+        <div class="modal-acciones">
+          <button class="btn btn-primary" type="submit">${editando ? 'Guardar cambios' : 'Crear usuario'}</button>
+          <button class="btn btn-outline" type="button" data-accion="cerrar">Cancelar</button>
+        </div>
+      </form>`);
+
+    $('#formUsuario').addEventListener('submit', (evento) => {
+      evento.preventDefault();
+      const nombre = $('#uNombre').value.trim();
+      const claveUsuario = $('#uUsuario').value.trim().toLowerCase();
+      const rol = $('#uRol').value;
+      const error = $('#usuarioError');
+
+      if (nombre.length < 3) {
+        error.textContent = 'Escribe el nombre completo.';
+        return;
+      }
+      if (!/^[a-z0-9._-]{3,20}$/.test(claveUsuario)) {
+        error.textContent = 'El usuario va sin espacios: 3 a 20 letras, números, punto o guion.';
+        return;
+      }
+
+      // Quitar el último administrador dejaría el sistema sin quien lo gestione.
+      if (editando && /admin/i.test(usuario.rol) && !/admin/i.test(rol) && !adminsRestantes(usuario.id)) {
+        error.textContent = 'Debe quedar al menos un administrador activo.';
+        return;
+      }
+
+      if (editando) {
+        Store.actualizarUsuario(usuario.id, { nombre, rol });
+        toast('Usuario actualizado');
+      } else {
+        if (buscarUsuario(claveUsuario)) {
+          error.textContent = 'Ese usuario ya existe.';
+          return;
+        }
+        const clave = $('#uClave').value.trim();
+        if (clave.length < 4) {
+          error.textContent = 'La clave necesita al menos 4 caracteres.';
+          return;
+        }
+        Store.addUsuario({ usuario: claveUsuario, nombre, rol, clave });
+        toast('Usuario creado');
+      }
+
+      Store.registrarAuditoria({
+        operador: estado.operador.nombre,
+        rol: estado.operador.rol,
+        via: 'cuenta',
+        cambios: [],
+        detalle: editando ? `Editó el usuario ${claveUsuario}` : `Creó el usuario ${claveUsuario}`
+      });
+      cerrarModal();
+      renderPerfiles();
+    });
+
+    setTimeout(() => $('#uNombre').focus(), 100);
+  }
+
+  /* --------------------------- Modales de soporte ------------------------- */
+
+  function modalNuevoTicket() {
+    abrirModal(`
+      <h2>Nuevo ticket de soporte</h2>
+      <p class="muted small">Queda registrado con tu nombre y la fecha. Soporte lo verá en su bandeja.</p>
+      <form id="formTicket" class="form-codigo" autocomplete="off">
+        <label class="field"><span>Asunto</span><input id="tAsunto" type="text" maxlength="80" placeholder="Ej. no puedo cambiar un precio" required /></label>
+        <label class="field"><span>Tema</span>
+          <select id="tCategoria">${CATEGORIAS_TICKET.map((c) => `<option>${c}</option>`).join('')}</select>
+        </label>
+        <label class="field"><span>Prioridad</span>
+          <select id="tPrioridad"><option>Normal</option><option>Alta</option><option>Urgente</option></select>
+        </label>
+        <label class="field"><span>¿Qué pasa?</span><textarea id="tMensaje" rows="3" maxlength="600" placeholder="Cuéntalo con el detalle que puedas." required></textarea></label>
+        <p class="form-error" id="ticketError" role="alert"></p>
+        <div class="modal-acciones">
+          <button class="btn btn-primary" type="submit">Enviar a soporte</button>
+          <button class="btn btn-outline" type="button" data-accion="cerrar">Cancelar</button>
+        </div>
+      </form>`);
+
+    $('#formTicket').addEventListener('submit', (evento) => {
+      evento.preventDefault();
+      const asunto = $('#tAsunto').value.trim();
+      const mensaje = $('#tMensaje').value.trim();
+      if (asunto.length < 4 || mensaje.length < 8) {
+        $('#ticketError').textContent = 'Pon un asunto y cuéntanos un poco más.';
+        return;
+      }
+      Store.addTicket({
+        asunto,
+        categoria: $('#tCategoria').value,
+        prioridad: $('#tPrioridad').value,
+        mensaje,
+        autor: estado.operador.nombre,
+        rol: estado.operador.rol
+      });
+      cerrarModal();
+      abrirPerfiles();
+      toast('Ticket enviado a soporte');
+    });
+
+    setTimeout(() => $('#tAsunto').focus(), 100);
+  }
+
+  function modalTicket(id) {
+    const ticket = Store.getTickets().find((t) => t.id === id);
+    if (!ticket) {
+      toast('Ese ticket ya no existe');
+      return;
+    }
+    const admin = esAdmin();
+    const respuestas = (ticket.respuestas || [])
+      .map((r) => `<div class="ticket-msg"><strong>${esc(r.autor)}</strong><span>${fechaCorta(r.fecha)}</span><p>${esc(r.texto)}</p></div>`)
+      .join('');
+
+    abrirModal(`
+      <h2>${esc(ticket.asunto)}</h2>
+      <p class="muted small">${esc(ticket.autor)} · ${fechaCorta(ticket.fecha)} · ${esc(ticket.categoria)} · ${esc(NOMBRE_ESTADO[ticket.estado] || ticket.estado)}</p>
+      <div class="ticket-hilo">
+        <div class="ticket-msg"><strong>${esc(ticket.autor)}</strong><span>${fechaCorta(ticket.fecha)}</span><p>${esc(ticket.mensaje)}</p></div>
+        ${respuestas}
+      </div>
+      ${admin && ticket.estado !== 'cerrada' ? `
+        <form id="formRespuesta" class="form-codigo">
+          <label class="field"><span>Respuesta</span><textarea id="rTexto" rows="2" placeholder="Qué le dices al operador" required></textarea></label>
+          <div class="modal-acciones">
+            <button class="btn btn-primary" type="submit">Responder</button>
+            <button class="btn btn-outline" type="button" data-cerrar-ticket="${esc(ticket.id)}">Cerrar ticket</button>
+          </div>
+        </form>` : ''}
+      ${!admin && ticket.estado !== 'cerrada' ? `<div class="modal-acciones"><button class="btn btn-outline" type="button" data-cerrar-ticket="${esc(ticket.id)}">Marcar como resuelto</button></div>` : ''}
+      <div class="modal-acciones"><button class="btn btn-ghost" type="button" data-accion="cerrar">Volver</button></div>`);
+
+    const form = $('#formRespuesta');
+    if (form) {
+      form.addEventListener('submit', (evento) => {
+        evento.preventDefault();
+        const texto = $('#rTexto').value.trim();
+        if (texto.length < 2) return;
+        Store.responderTicket(ticket.id, { autor: estado.operador.nombre, rol: estado.operador.rol, texto });
+        cerrarModal();
+        abrirPerfiles();
+        toast('Respuesta guardada');
+      });
+    }
+  }
+
+  function cerrarTicket(id) {
+    const ticket = Store.getTickets().find((t) => t.id === id);
+    if (!ticket) return;
+    Store.actualizarTicket(id, { estado: 'cerrada', atendidoPor: estado.operador.nombre });
+    cerrarModal();
+    abrirPerfiles();
+    toast('Ticket cerrado');
+  }
+
+  /* ------------------------------- Arranque ----------------------------- */
+
+  function init() {
+    iniciarIntro();
+
+    // Los operadores de config.js pasan a ser cuentas gestionables.
+    sembrarUsuarios();
+
+    // Versión visible, tomada de config.js para que no se desincronice.
+    const etiquetaVersion = document.getElementById('versionApp');
+    if (etiquetaVersion && CONFIG.version) etiquetaVersion.textContent = 'v' + CONFIG.version;
+
+    // Descarta precios guardados por versiones anteriores: todo nace en 0.00.
+    Store.migrarPrecios();
+
+    $('#formaPago').innerHTML = CONFIG.pagos.map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+    $('#estadoPago').innerHTML = CONFIG.estadosPago.map((e) => `<option value="${e.id}">${esc(e.nombre)}</option>`).join('');
+    $('#estadoPago').value = 'pendiente';
+    $('#filtroEstado').innerHTML =
+      '<option value="">Todos los estados</option>' +
+      CONFIG.estados.map((e) => `<option value="${e.id}">${esc(e.nombre)}</option>`).join('');
+
+    conectarEventos();
+    actualizarCodigoCliente();
+    renderCategorias();
+    renderCatalogo();
+    renderItems();
+    limpiarRecojo();
+    refrescarResumen();
+    actualizarFechas();
+    prepararAcceso();
+    restaurarSesion();
+
+    if (!Store.disponible) {
+      console.warn('Sin localStorage: los datos se perderán al cerrar la pestaña.');
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', init);
+})();

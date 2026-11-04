@@ -1,0 +1,528 @@
+﻿/* ==========================================================================
+   Lavandería Mili · Persistencia local
+   Guarda órdenes y clientes en localStorage. Si el navegador lo bloquea,
+   cae a memoria para que la sesión siga funcionando.
+   ========================================================================== */
+
+const Store = (() => {
+  const NS = 'lavamili.v1';
+  const KEYS = {
+    ordenes: `${NS}.ordenes`,
+    clientes: `${NS}.clientes`,
+    precios: `${NS}.precios`,
+    autorizacion: `${NS}.autorizacion`,
+    solicitudes: `${NS}.solicitudes`,
+    auditoria: `${NS}.auditoria`,
+    usuarios: `${NS}.usuarios`,
+    tickets: `${NS}.tickets`
+  };
+
+
+  const memoria = {};
+  let disponible = true;
+
+   /* Avisos de escritura: cualquier módulo puede suscribirse para saber cuándo
+      cambian los datos. `silencio` permite escribir sin avisar (lo usa la
+      restauración de un respaldo). */
+  const oyentes = new Set();
+  let silencio = false;
+
+  /** Id único incluso si se crean varios registros en el mismo milisegundo. */
+  const nuevoId = (prefijo) => `${prefijo}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+
+  try {
+    const prueba = `${NS}.test`;
+    localStorage.setItem(prueba, '1');
+    localStorage.removeItem(prueba);
+  } catch (error) {
+    disponible = false;
+  }
+
+  function leer(clave, porDefecto) {
+    try {
+      const crudo = disponible ? localStorage.getItem(clave) : memoria[clave];
+      if (!crudo) return porDefecto;
+      const datos = JSON.parse(crudo);
+      return datos ?? porDefecto;
+    } catch (error) {
+      console.warn('No se pudo leer', clave, error);
+      return porDefecto;
+    }
+  }
+
+  function escribir(clave, valor) {
+    const crudo = JSON.stringify(valor);
+    try {
+      if (disponible) localStorage.setItem(clave, crudo);
+      else memoria[clave] = crudo;
+    } catch (error) {
+      disponible = false;
+      memoria[clave] = crudo;
+      console.warn('Almacenamiento lleno o bloqueado, usando memoria', error);
+    }
+    if (!silencio) {
+      oyentes.forEach((fn) => {
+        try {
+          fn(clave, valor);
+        } catch (error) {
+          console.warn('Oyente de escritura falló', error);
+        }
+      });
+    }
+  }
+
+  /** Registra un callback que se dispara en cada escritura local. */
+  function alEscribir(fn) {
+    oyentes.add(fn);
+    return () => oyentes.delete(fn);
+  }
+
+  /** Escribe el espejo local con datos que vienen de la nube, sin re-emitir. */
+  function aplicarRemoto(datos) {
+    silencio = true;
+    try {
+      if (Array.isArray(datos.ordenes)) escribir(KEYS.ordenes, datos.ordenes);
+      if (Array.isArray(datos.clientes)) escribir(KEYS.clientes, datos.clientes);
+      if (datos.precios && typeof datos.precios === 'object') escribir(KEYS.precios, datos.precios);
+      if (datos.autorizacion !== undefined) escribir(KEYS.autorizacion, datos.autorizacion || null);
+      if (Array.isArray(datos.solicitudes)) escribir(KEYS.solicitudes, datos.solicitudes);
+      if (Array.isArray(datos.auditoria)) escribir(KEYS.auditoria, datos.auditoria);
+      if (Array.isArray(datos.usuarios)) escribir(KEYS.usuarios, datos.usuarios);
+      if (Array.isArray(datos.tickets)) escribir(KEYS.tickets, datos.tickets);
+    } finally {
+      silencio = false;
+    }
+  }
+
+  /* ------------------------------ Órdenes ------------------------------ */
+
+  function getOrdenes() {
+    const lista = leer(KEYS.ordenes, []);
+    return Array.isArray(lista) ? lista : [];
+  }
+
+  function setOrdenes(lista) {
+    escribir(KEYS.ordenes, lista);
+  }
+
+  function siguienteCodigo(prefijo, lista, anio) {
+    const patron = new RegExp(`^${prefijo}-${anio}-(\\d+)$`);
+    const max = lista.reduce((acc, item) => {
+      const match = patron.exec(item.codigo || '');
+      return match ? Math.max(acc, Number(match[1])) : acc;
+    }, 0);
+    return `${prefijo}-${anio}-${String(max + 1).padStart(4, '0')}`;
+  }
+
+  function nextOrderCode(fecha = new Date()) {
+    return siguienteCodigo('OT', getOrdenes(), fecha.getFullYear());
+  }
+
+  function addOrden(orden) {
+    const lista = getOrdenes();
+    const nueva = {
+      ...orden,
+      codigo: orden.codigo || siguienteCodigo('OT', lista, new Date(orden.ingreso || Date.now()).getFullYear())
+    };
+    lista.push(nueva);
+    setOrdenes(lista);
+    return nueva;
+  }
+
+  function updateOrden(id, cambios) {
+    const lista = getOrdenes();
+    const indice = lista.findIndex((o) => o.id === id);
+    if (indice === -1) return null;
+    lista[indice] = { ...lista[indice], ...cambios };
+    setOrdenes(lista);
+    return lista[indice];
+  }
+
+  function getOrden(id) {
+    return getOrdenes().find((o) => o.id === id) || null;
+  }
+
+  /* ------------------------------ Clientes ----------------------------- */
+
+  function getClientes() {
+    const lista = leer(KEYS.clientes, []);
+    return Array.isArray(lista) ? lista : [];
+  }
+
+  function setClientes(lista) {
+    escribir(KEYS.clientes, lista);
+  }
+
+  function claveTelefono(telefono) {
+    let digitos = String(telefono || '').replace(/\D/g, '');
+    if (digitos.length > 9 && digitos.startsWith('51')) digitos = digitos.slice(2);
+    return digitos.slice(-9);
+  }
+
+  function buscarPorTelefono(telefono) {
+    const clave = claveTelefono(telefono);
+    if (clave.length < 6) return null;
+    return getClientes().find((c) => c.clave === clave) || null;
+  }
+
+  function nextClienteCode() {
+    const max = getClientes().reduce((acc, c) => {
+      const match = /^CLI-(\d+)$/.exec(c.codigo || '');
+      return match ? Math.max(acc, Number(match[1])) : acc;
+    }, 0);
+    return `CLI-${String(max + 1).padStart(4, '0')}`;
+  }
+
+  /**
+   * Crea o actualiza un cliente por teléfono. Devuelve el cliente guardado.
+   */
+  function upsertCliente({ telefono, nombre, email }) {
+    const lista = getClientes();
+    const clave = claveTelefono(telefono);
+    const indice = lista.findIndex((c) => c.clave === clave);
+    const ahora = new Date().toISOString();
+
+    if (indice >= 0) {
+      const actual = lista[indice];
+      lista[indice] = {
+        ...actual,
+        codigo: actual.codigo || nextClienteCode(),
+        nombre: nombre || actual.nombre,
+        email: email || actual.email,
+        telefono: telefono || actual.telefono,
+        actualizado: ahora
+      };
+      setClientes(lista);
+      return lista[indice];
+    }
+
+    const nuevo = {
+      id: nuevoId('cli'),
+      codigo: nextClienteCode(),
+      clave,
+      nombre: nombre || 'Cliente',
+      telefono: telefono || '',
+      email: email || '',
+      creado: ahora,
+      actualizado: ahora
+    };
+    lista.push(nuevo);
+    setClientes(lista);
+    return nuevo;
+  }
+
+  /**
+   * Correlativo de servicios del cliente (1, 2, 3…).
+   * El código de cliente nunca cambia; cada servicio suma uno nuevo.
+   */
+  function siguienteServicio(clienteId, clienteCodigo) {
+    const previos = getOrdenes().filter((o) => o.clienteId === clienteId || o.clienteCodigo === clienteCodigo);
+    const max = previos.reduce((acc, o) => Math.max(acc, Number(o.servicioN) || 0), 0);
+    return Math.max(max, previos.length) + 1;
+  }
+
+  /** Edita la ficha de un cliente existente (solo desde administración). */
+  function actualizarCliente(id, cambios) {
+    const lista = getClientes();
+    const indice = lista.findIndex((c) => c.id === id);
+    if (indice < 0) return null;
+    const actualizado = {
+      ...lista[indice],
+      ...cambios,
+      nombre: String((cambios.nombre !== undefined ? cambios.nombre : lista[indice].nombre) || '').trim(),
+      telefono: String((cambios.telefono !== undefined ? cambios.telefono : lista[indice].telefono) || '').trim(),
+      email: String((cambios.email !== undefined ? cambios.email : lista[indice].email) || '').trim()
+    };
+    actualizado.clave = claveTelefono(actualizado.telefono);
+    lista[indice] = actualizado;
+    setClientes(lista);
+    return actualizado;
+  }
+
+  function statsCliente(cliente) {
+    const ordenes = getOrdenes().filter((o) => o.clienteId === cliente.id || o.clienteCodigo === cliente.codigo);
+    return {
+      ordenes: ordenes.length,
+      total: ordenes.reduce((acc, o) => acc + (Number(o.total) || 0), 0),
+      ultima: ordenes.reduce((acc, o) => (o.ingreso > (acc || '') ? o.ingreso : acc), '')
+    };
+  }
+
+  /* ------------------------------- Precios ------------------------------ */
+
+  /** Tarifas personalizadas: { idServicio: precio }. Vacío = precios de fábrica. */
+  function getPrecios() {
+    const datos = leer(KEYS.precios, {});
+    return datos && typeof datos === 'object' && !Array.isArray(datos) ? datos : {};
+  }
+
+  function setPrecios(mapa) {
+    escribir(KEYS.precios, mapa && typeof mapa === 'object' ? mapa : {});
+  }
+
+  /* Los precios de fábrica pasaron a 0.00: la primera vez que se abre esta
+     versión se descartan los precios guardados de la versión anterior, para
+     que todo arranque en cero y el operador escriba el precio del servicio. */
+  const CLAVE_VERSION_PRECIOS = `${NS}.precios.version`;
+  const CLAVE_RESET_PRECIOS = `${NS}.precios.reset`;
+  const VERSION_PRECIOS = 'cero2';
+
+  function migrarPrecios() {
+    try {
+      if (localStorage.getItem(CLAVE_VERSION_PRECIOS) === VERSION_PRECIOS) return false;
+      const guardados = localStorage.getItem(KEYS.precios);
+      const teniaPrecios = Boolean(guardados) && guardados !== '{}' && guardados !== 'null';
+      localStorage.removeItem(KEYS.precios);
+      localStorage.setItem(CLAVE_VERSION_PRECIOS, VERSION_PRECIOS);
+      /* Solo se marca el reinicio para la nube si ESTE equipo tenía precios
+         guardados de una versión anterior. Un navegador nuevo (o con la caché
+         limpia) no debe borrar el tarifario que ya está configurado en
+         Firestore. */
+      if (teniaPrecios) localStorage.setItem(CLAVE_RESET_PRECIOS, '1');
+      return teniaPrecios;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /** ¿Falta propagar el reinicio de precios a la nube? */
+  function resetPreciosPendiente() {
+    try {
+      return localStorage.getItem(CLAVE_RESET_PRECIOS) === '1';
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function limpiarResetPrecios() {
+    try {
+      localStorage.removeItem(CLAVE_RESET_PRECIOS);
+    } catch (error) {
+      /* nada */
+    }
+  }
+
+  /* --------------------- Autorización y solicitudes --------------------- */
+
+  /* Código de urgencia vigente que entrega el administrador:
+     { codigo, autor, creada, expira }. Uno solo a la vez. */
+  function getAutorizacion() {
+    const datos = leer(KEYS.autorizacion, null);
+    return datos && typeof datos === 'object' && datos.codigo ? datos : null;
+  }
+
+  function setAutorizacion(datos) {
+    escribir(KEYS.autorizacion, datos && datos.codigo ? datos : null);
+  }
+
+  /* Pedidos de cambio que el mostrador envía al administrador. */
+  function getSolicitudes() {
+    const lista = leer(KEYS.solicitudes, []);
+    return Array.isArray(lista) ? lista : [];
+  }
+
+  function setSolicitudes(lista) {
+    escribir(KEYS.solicitudes, Array.isArray(lista) ? lista : []);
+  }
+
+  function addSolicitud(solicitud) {
+    const lista = getSolicitudes();
+    const nueva = {
+      id: nuevoId('sol'),
+      creada: new Date().toISOString(),
+      estado: 'pendiente',
+      ...solicitud
+    };
+    lista.unshift(nueva);
+    setSolicitudes(lista);
+    return nueva;
+  }
+
+  function resolverSolicitud(id, cambios) {
+    const lista = getSolicitudes();
+    const indice = lista.findIndex((s) => s.id === id);
+    if (indice === -1) return null;
+    lista[indice] = { ...lista[indice], ...cambios, resuelta: new Date().toISOString() };
+    setSolicitudes(lista);
+    return lista[indice];
+  }
+
+  /* Historial de cambios de tarifa: quién, cuándo y con qué código. */
+  function getAuditoria() {
+    const lista = leer(KEYS.auditoria, []);
+    return Array.isArray(lista) ? lista : [];
+  }
+
+  function registrarAuditoria(entrada) {
+    const lista = getAuditoria();
+    lista.unshift({ ...entrada, fecha: entrada.fecha || new Date().toISOString() });
+    setAuditoria(lista.slice(0, 300));
+    return lista[0];
+  }
+
+  function setAuditoria(lista) {
+    escribir(KEYS.auditoria, Array.isArray(lista) ? lista.slice(0, 300) : []);
+  }
+
+  /* ------------------------------ Usuarios ------------------------------ */
+
+  /* Directorio de trabajo: lo que se crea en «Perfiles». Los operadores de
+     config.js son la semilla inicial; desde ahí manda este directorio. */
+  function getUsuarios() {
+    const lista = leer(KEYS.usuarios, []);
+    return Array.isArray(lista) ? lista : [];
+  }
+
+  function setUsuarios(lista) {
+    escribir(KEYS.usuarios, Array.isArray(lista) ? lista : []);
+  }
+
+  function addUsuario(datos) {
+    const lista = getUsuarios();
+    const nuevo = {
+      id: nuevoId('u'),
+      usuario: String(datos.usuario || '').trim(),
+      nombre: String(datos.nombre || '').trim(),
+      rol: String(datos.rol || 'Operador'),
+      clave: String(datos.clave || ''),
+      activo: datos.activo !== false,
+      creado: new Date().toISOString(),
+      ultimoAcceso: ''
+    };
+    lista.push(nuevo);
+    setUsuarios(lista);
+    return nuevo;
+  }
+
+  function actualizarUsuario(id, cambios) {
+    const lista = getUsuarios();
+    const i = lista.findIndex((u) => u.id === id);
+    if (i < 0) return null;
+    lista[i] = { ...lista[i], ...cambios };
+    setUsuarios(lista);
+    return lista[i];
+  }
+
+  function borrarUsuario(id) {
+    setUsuarios(getUsuarios().filter((u) => u.id !== id));
+  }
+
+  /* ------------------------------ Soporte ------------------------------- */
+
+  function getTickets() {
+    const lista = leer(KEYS.tickets, []);
+    return Array.isArray(lista) ? lista : [];
+  }
+
+  function setTickets(lista) {
+    escribir(KEYS.tickets, Array.isArray(lista) ? lista : []);
+  }
+
+  function addTicket(datos) {
+    const lista = getTickets();
+    const ticket = {
+      id: nuevoId('t'),
+      asunto: String(datos.asunto || '').trim(),
+      categoria: String(datos.categoria || 'Otro'),
+      prioridad: String(datos.prioridad || 'Normal'),
+      mensaje: String(datos.mensaje || '').trim(),
+      autor: String(datos.autor || ''),
+      rol: String(datos.rol || ''),
+      fecha: new Date().toISOString(),
+      estado: 'abierta',
+      atendidoPor: '',
+      respuestas: []
+    };
+    lista.unshift(ticket);
+    setTickets(lista.slice(0, 200));
+    return ticket;
+  }
+
+  function actualizarTicket(id, cambios) {
+    const lista = getTickets();
+    const i = lista.findIndex((t) => t.id === id);
+    if (i < 0) return null;
+    lista[i] = { ...lista[i], ...cambios };
+    setTickets(lista);
+    return lista[i];
+  }
+
+  function responderTicket(id, respuesta) {
+    const lista = getTickets();
+    const i = lista.findIndex((t) => t.id === id);
+    if (i < 0) return null;
+    const ticket = lista[i];
+    ticket.respuestas = Array.isArray(ticket.respuestas) ? ticket.respuestas : [];
+    ticket.respuestas.push({ ...respuesta, fecha: new Date().toISOString() });
+    if (ticket.estado === 'abierta') ticket.estado = 'en proceso';
+    setTickets(lista);
+    return ticket;
+  }
+
+  function snapshot() {
+    return {
+      generado: new Date().toISOString(),
+      ordenes: getOrdenes(),
+      clientes: getClientes(),
+      precios: getPrecios(),
+      auditoria: getAuditoria()
+    };
+  }
+
+  function reemplazarTodo({ ordenes, clientes, precios }) {
+    if (Array.isArray(ordenes)) setOrdenes(ordenes);
+    if (Array.isArray(clientes)) setClientes(clientes);
+    if (precios && typeof precios === 'object') setPrecios(precios);
+  }
+
+  return {
+    // Getter: el valor real puede cambiar si el navegador bloquea localStorage.
+    get disponible() {
+      return disponible;
+    },
+    KEYS,
+    alEscribir,
+    aplicarRemoto,
+    getOrdenes,
+    setOrdenes,
+    getOrden,
+    addOrden,
+    updateOrden,
+    nextOrderCode,
+    getClientes,
+    setClientes,
+    buscarPorTelefono,
+    upsertCliente,
+    actualizarCliente,
+    nextClienteCode,
+    siguienteServicio,
+    statsCliente,
+    getPrecios,
+    setPrecios,
+    migrarPrecios,
+    resetPreciosPendiente,
+    limpiarResetPrecios,
+    getAutorizacion,
+    setAutorizacion,
+    getSolicitudes,
+    setSolicitudes,
+    addSolicitud,
+    resolverSolicitud,
+    getAuditoria,
+    setAuditoria,
+    registrarAuditoria,
+    getUsuarios,
+    setUsuarios,
+    addUsuario,
+    actualizarUsuario,
+    borrarUsuario,
+    getTickets,
+    setTickets,
+    addTicket,
+    actualizarTicket,
+    responderTicket,
+    claveTelefono,
+    snapshot,
+    reemplazarTodo
+  };
+})();
