@@ -20,7 +20,11 @@ restricciones de archivos locales.
 
 **Publicada en GitHub Pages**
 
-<https://leonnnc.github.io/LavanderiaMili/>
+Actívala una vez en *Settings → Pages → Branch: `main`, carpeta `/ (root)`*. La
+dirección queda como <https://leonnnc.github.io/LavanderiaMili/>.
+
+Ten en cuenta que en la web los datos quedan en el navegador de cada equipo, no
+en el repositorio.
 
 ## Acceso
 
