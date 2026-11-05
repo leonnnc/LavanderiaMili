@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0f766e" />
   <meta name="description" content="Sistema de control de entradas y salidas para lavandería: clientes, pesaje, precios y avisos de recojo por WhatsApp." />
   <title>Lavandería Mili · Control de lavandería</title>
-  <link rel="stylesheet" href="assets/css/estilos.css?v=20261104d" />
+  <link rel="stylesheet" href="assets/css/estilos.css?v=1.0.1" />
 </head>
 <body>
 
@@ -50,8 +50,32 @@
         </div>
       </div>
 
-      <h1>Control de servicios</h1>
-      <p class="login-sub">Registra entradas, pesajes, precios y avisos de recojo. Acceso exclusivo para operadores.</p>
+      <h1 id="loginTitulo">Control de servicios</h1>
+      <p class="login-sub" id="loginSubtitulo">Registra entradas, pesajes, precios y avisos de recojo. Acceso exclusivo para operadores.</p>
+
+      <form id="formPrimerAcceso" autocomplete="off" novalidate hidden>
+        <p class="login-sub">Este equipo todavía no tiene cuentas. Crea la de administración; después podrás agregar al resto del personal desde «Perfiles».</p>
+        <div class="field">
+          <label for="paNombre">Nombre y apellido</label>
+          <input id="paNombre" type="text" placeholder="Quién administra" autocomplete="off" required />
+        </div>
+        <div class="field">
+          <label for="paUsuario">Usuario</label>
+          <input id="paUsuario" type="text" placeholder="Sin espacios, ej. mili" autocomplete="off" autocapitalize="none" spellcheck="false" required />
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="paPin">PIN</label>
+            <input id="paPin" type="password" inputmode="numeric" placeholder="4 a 8 dígitos" autocomplete="new-password" required />
+          </div>
+          <div class="field">
+            <label for="paPin2">Repite el PIN</label>
+            <input id="paPin2" type="password" inputmode="numeric" placeholder="Confirma" autocomplete="new-password" required />
+          </div>
+        </div>
+        <p class="form-error" id="paError" role="alert"></p>
+        <button class="btn btn-primary btn-block" type="submit">Crear cuenta y entrar</button>
+      </form>
 
       <form id="formLogin" autocomplete="off" novalidate>
         <div class="field">
@@ -661,11 +685,11 @@
   <!-- Comprobante para impresión (solo visible al imprimir) -->
   
 
-  <script src="assets/js/config.js?v=1.0"></script>
-  <script src="assets/js/store.js?v=1.0"></script>
-  <script src="assets/js/comprobante.js?v=1.0"></script>
-  <script src="assets/js/ticket.js?v=1.0"></script>
-  <script defer src="assets/js/local.js?v=1.0"></script>
-  <script defer src="assets/js/app.js?v=1.0"></script>
+  <script src="assets/js/config.js?v=1.0.1"></script>
+  <script src="assets/js/store.js?v=1.0.1"></script>
+  <script src="assets/js/comprobante.js?v=1.0.1"></script>
+  <script src="assets/js/ticket.js?v=1.0.1"></script>
+  <script defer src="assets/js/local.js?v=1.0.1"></script>
+  <script defer src="assets/js/app.js?v=1.0.1"></script>
 </body>
 </html>

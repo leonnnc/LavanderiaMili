@@ -10,7 +10,7 @@
   'use strict';
 
   const $ = (sel) => document.querySelector(sel);
-  const CLAVE_LOCAL = 'lavamili.v1.tickets';
+  const CLAVE_LOCAL = 'lavamili.prod.v1.tickets';
 
   let tickets = [];
   let seleccionado = null;

@@ -28,16 +28,13 @@ en el repositorio.
 
 ## Acceso
 
-El control de entrada es el directorio de operadores de `assets/js/config.js`:
+El sistema **no trae usuarios**: el equipo arranca en blanco.
 
-| Usuario     | PIN    | Rol           |
-| ----------- | ------ | ------------- |
-| `mili`      | `1234` | Administradora |
-| `mostrador` | `2024` | Operadora      |
-
-**Cambia los dos PIN antes de entregar el sistema.** Se pueden editar en el panel
-«Perfiles» (solo administración) o directamente en `config.js`; lo guardado en
-«Perfiles» manda sobre el archivo.
+1. La primera vez, la pantalla de acceso pide crear la cuenta de administración
+   (nombre, usuario, PIN de 4 a 8 dígitos).
+2. Con esa cuenta se entra y se agrega al resto del personal desde «Perfiles».
+3. `assets/js/config.js` tiene `operadores: []` a propósito; lo que se guarda en
+   «Perfiles» es el directorio real y manda sobre ese archivo.
 
 - La **Administradora** edita tarifas, perfiles, datos y respaldos.
 - La **Operadora** registra servicios, cobra y actualiza estados.
@@ -48,7 +45,8 @@ minutos).
 
 ## Dónde viven los datos
 
-En el navegador del equipo (`localStorage`), bajo la clave `lavamili.v1.*`. No se
+En el navegador del equipo (`localStorage`), bajo la clave `lavamili.prod.v1.*`.
+El sistema arranca sin usuarios, sin clientes, sin órdenes y sin tickets. No se
 envía nada a internet: no hay Firebase, ni cuentas de correo, ni sincronización.
 
 Consecuencias prácticas:
@@ -76,7 +74,11 @@ servir-local.bat         Servidor local para Windows
 
 ## Diferencias con la versión de desarrollo
 
+- El sistema arranca en blanco: sin usuarios, clientes, órdenes ni tickets. La
+  primera cuenta se crea en la pantalla de acceso.
 - Se eliminaron las órdenes de ejemplo y el botón «Cargar 6 órdenes de ejemplo».
+- Los datos usan la clave `lavamili.prod.v1.*`, separada de la versión de
+  desarrollo, para que no herede nada de ella.
 - El acceso es únicamente con usuario y PIN: no hay Firebase Auth, ni
   recuperación por correo, ni PIN de desarrollo.
 - Se retiró la sincronización con Firestore, las reglas de seguridad y la guía de
@@ -85,7 +87,7 @@ servir-local.bat         Servidor local para Windows
 
 ## Pendientes antes de operar con clientes
 
-1. Cambiar los PIN de `config.js` o desde «Perfiles».
+1. Crear la cuenta de administración en el primer arranque.
 2. Completar los datos del negocio (dirección, teléfono, horario) en `config.js`.
 3. Cargar el tarifario real desde el panel «Precios».
 4. Definir quién descarga el respaldo y con qué frecuencia.

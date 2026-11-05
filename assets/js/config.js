@@ -83,19 +83,13 @@ const CONFIG = {
     horario: 'Lun a Sáb · 9:00 a 19:00'
   },
 
-  /* Cuentas de acceso al sistema. Este es el único control de entrada: no hay
-     Firebase ni recuperación por correo.
+  /* Cuentas de acceso. Va vacío a propósito: el equipo arranca sin usuarios y la
+     primera cuenta (Administradora) se crea en la pantalla de acceso. Las demás
+     se agregan desde «Perfiles», que es el directorio que manda después.
 
-     · `Administradora` puede editar precios, perfiles y datos.
-     · `Operadora` solo registra y cobra servicios.
-
-     CAMBIA LOS PIN ANTES DE ENTREGAR EL SISTEMA. Se pueden editar desde el
-     panel «Perfiles» (solo administración) o directamente aquí; lo que se
-     guarde en «Perfiles» manda sobre este archivo. */
-  operadores: [
-    { usuario: 'mili', pin: '1234', nombre: 'Mili Rojas', rol: 'Administradora' },
-    { usuario: 'mostrador', pin: '2024', nombre: 'Karla Ruiz', rol: 'Operadora' }
-  ],
+     Si algún día necesitas precargar una cuenta, usa esta forma:
+     { usuario: 'nombre', pin: '123456', nombre: 'Nombre Apellido', rol: 'Administradora' } */
+  operadores: [],
 
   categorias: [
     { id: 'todos', nombre: 'Todos' },

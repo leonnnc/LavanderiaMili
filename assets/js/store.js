@@ -5,7 +5,7 @@
    ========================================================================== */
 
 const Store = (() => {
-  const NS = 'lavamili.v1';
+  const NS = 'lavamili.prod.v1';
   const KEYS = {
     ordenes: `${NS}.ordenes`,
     clientes: `${NS}.clientes`,

@@ -7,7 +7,7 @@
 window.Ticket = (function () {
   'use strict';
 
-  const CLAVE = 'lavamili.v1.impresion';
+  const CLAVE = 'lavamili.prod.v1.impresion';
   const ANCHOS = [58, 80];
 
   /* `papel` es el ancho del rollo y `util` la zona imprimible del cabezal:

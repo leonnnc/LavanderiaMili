@@ -1,4 +1,4 @@
-﻿/* ==========================================================================
+/* ==========================================================================
    Lavandería Mili · Lógica de la aplicación
    ========================================================================== */
 
@@ -7,7 +7,7 @@
 
   const $ = (sel, raiz = document) => raiz.querySelector(sel);
   const $$ = (sel, raiz = document) => Array.from(raiz.querySelectorAll(sel));
-  const SESION_KEY = 'lavamili.v1.sesion';
+  const SESION_KEY = 'lavamili.prod.v1.sesion';
 
   const dinero = new Intl.NumberFormat('es-PE', {
     style: 'currency',
@@ -130,15 +130,8 @@
 
   /* ------------------------ Directorio de usuarios ----------------------- */
 
-  /* Los operadores de config.js son la semilla. Desde que el administrador
-     toca algo en «Perfiles», manda el directorio guardado. */
-  function sembrarUsuarios() {
-    if (Store.getUsuarios().length) return;
-    CONFIG.operadores.forEach((o) => {
-      Store.addUsuario({ usuario: o.usuario, nombre: o.nombre, rol: o.rol, clave: o.pin });
-    });
-  }
-
+  /* El equipo arranca sin cuentas: la primera se crea en la pantalla de acceso y
+     el resto desde «Perfiles». `CONFIG.operadores` queda vacío a propósito. */
   function directorio() {
     const mapa = new Map();
     CONFIG.operadores.forEach((o) => {
@@ -290,11 +283,58 @@
     el.dataset.estado = 'local';
   }
 
-  /** El acceso es siempre usuario + PIN: el formulario no cambia por entorno. */
+  /** Muestra el acceso normal o, si el equipo está en blanco, el alta del
+      primer administrador. */
   function ajustarFormularioLogin() {
+    const vacio = directorio().length === 0;
+    const login = $('#formLogin');
+    const alta = $('#formPrimerAcceso');
     const nota = $('#loginModo');
+    const titulo = $('#loginTitulo');
+    const subtitulo = $('#loginSubtitulo');
+
+    if (login) login.hidden = vacio;
+    if (alta) alta.hidden = !vacio;
+    if (titulo) titulo.textContent = vacio ? 'Primer arranque' : 'Control de servicios';
+    if (subtitulo) {
+      subtitulo.textContent = vacio
+        ? 'Sin datos cargados: empieza creando la cuenta de administración.'
+        : 'Registra entradas, pesajes, precios y avisos de recojo. Acceso exclusivo para operadores.';
+    }
     if (!nota) return;
-    nota.textContent = 'Acceso con usuario y PIN. Los datos se guardan solo en este navegador.';
+    nota.textContent = vacio
+      ? 'Los datos se guardan solo en este navegador.'
+      : 'Acceso con usuario y PIN. Los datos se guardan solo en este navegador.';
+  }
+
+  /** Crea la cuenta de administración cuando el equipo no tiene ninguna. */
+  function crearPrimerAcceso(evento) {
+    evento.preventDefault();
+    const nombre = $('#paNombre').value.trim();
+    const usuario = $('#paUsuario').value.trim().toLowerCase();
+    const pin = $('#paPin').value.trim();
+    const pin2 = $('#paPin2').value.trim();
+    const aviso = $('#paError');
+    aviso.textContent = '';
+
+    if (nombre.length < 3) return (aviso.textContent = 'Escribe el nombre de quien administra.');
+    if (!/^[a-z0-9._-]{3,16}$/.test(usuario)) {
+      return (aviso.textContent = 'El usuario va sin espacios: de 3 a 16 letras, números, punto o guion.');
+    }
+    if (!/^\d{4,8}$/.test(pin)) return (aviso.textContent = 'El PIN debe tener de 4 a 8 dígitos.');
+    if (pin !== pin2) return (aviso.textContent = 'Los dos PIN no coinciden.');
+
+    Store.addUsuario({ usuario, nombre, rol: 'Administradora', clave: pin });
+    estado.operador = { usuario, nombre, rol: 'Administradora' };
+    try {
+      sessionStorage.setItem(SESION_KEY, JSON.stringify(estado.operador));
+    } catch (error) { /* modo privado */ }
+    $('#paNombre').value = '';
+    $('#paUsuario').value = '';
+    $('#paPin').value = '';
+    $('#paPin2').value = '';
+    ajustarFormularioLogin();
+    entrarAlSistema();
   }
 
   function prepararAcceso() {
@@ -382,7 +422,7 @@
   const SEGURIDAD = (typeof CONFIG !== 'undefined' && CONFIG.seguridad) || {};
   const MINUTOS_AUTORIZACION = Number(SEGURIDAD.minutosAutorizacion) > 0 ? Number(SEGURIDAD.minutosAutorizacion) : 15;
   const LARGO_CODIGO = Number(SEGURIDAD.largoCodigo) > 0 ? Number(SEGURIDAD.largoCodigo) : 5;
-  const CLAVE_AUTORIZACION = 'lavamili.v1.autorizacion.sesion';
+  const CLAVE_AUTORIZACION = 'lavamili.prod.v1.autorizacion.sesion';
 
   /* Correos con permiso de administración aunque su ficha diga otra cosa. */
   const CORREOS_ADMIN = (Array.isArray(SEGURIDAD.correosAdmin) ? SEGURIDAD.correosAdmin : [])
@@ -3241,6 +3281,7 @@
 
   function conectarEventos() {
     $('#formLogin').addEventListener('submit', iniciarSesion);
+    $('#formPrimerAcceso').addEventListener('submit', crearPrimerAcceso);
 
     $('#btnSalir').addEventListener('click', cerrarSesion);
     $('#btnDatos').addEventListener('click', abrirDatos);
@@ -4145,7 +4186,6 @@
     iniciarIntro();
 
     // Los operadores de config.js pasan a ser cuentas gestionables.
-    sembrarUsuarios();
 
     // Versión visible, tomada de config.js para que no se desincronice.
     const etiquetaVersion = document.getElementById('versionApp');
